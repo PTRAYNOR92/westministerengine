@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Westminster Engine — performance data for Parliament</title>
+<meta name="description" content="Every question counted, every division tracked, every MP profiled. Computed nightly from the official parliamentary record.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#07090F; --panel:rgba(255,255,255,.028); --border:rgba(255,255,255,.09);
+  --border-b:rgba(255,255,255,.2); --text:#E9EDF5; --dim:#8A94A8; --faint:#525D72;
+  --violet:#7C6BFF; --cyan:#00D4FF; --hot:#FF4D6D; --warm:#FFB347; --cool:#00E5A0;
+  --grad:linear-gradient(120deg,#7C6BFF,#00D4FF);
+  --disp:'Space Grotesk',sans-serif; --body:'Inter',sans-serif; --mono:'JetBrains Mono',monospace;
+}
+*{box-sizing:border-box;margin:0}
+::selection{background:var(--violet);color:var(--bg)}
+body{
+  background:
+    radial-gradient(1200px 600px at 80% -10%,rgba(124,107,255,.13),transparent),
+    radial-gradient(900px 500px at 0% 110%,rgba(0,212,255,.08),transparent),
+    var(--bg);
+  color:var(--text); font-family:var(--body); min-height:100vh; padding-bottom:80px;
+}
+.banner{background:rgba(124,107,255,.12);border-bottom:1px solid rgba(124,107,255,.3);
+  font:600 10.5px var(--mono);letter-spacing:1px;text-align:center;padding:7px 12px;color:var(--text)}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+header{padding:30px 0 0}
+.eyebrow{font:600 10px var(--mono);letter-spacing:3px;color:var(--violet)}
+h1{font:700 38px/1 var(--disp);margin:4px 0 6px;
+  background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{font-size:13px;color:var(--dim);max-width:640px}
+.head{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:16px}
+nav{display:flex;gap:6px;background:rgba(255,255,255,.04);border:1px solid var(--border);
+  border-radius:99px;padding:4px}
+nav button{font:600 13px var(--disp);padding:9px 20px;border-radius:99px;border:none;
+  cursor:pointer;background:transparent;color:var(--dim);transition:.15s}
+nav button.on{background:var(--grad);color:var(--bg)}
+main{margin-top:26px}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+  padding:20px;backdrop-filter:blur(8px);animation:rise .35s ease both}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes barIn{from{width:0}}
+.label{font:600 10px var(--mono);letter-spacing:1.8px;color:var(--faint);
+  text-transform:uppercase;margin-bottom:10px}
+.grid{display:grid;gap:14px}
+@media(min-width:900px){.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:1fr 1fr 1fr}}
+.row{display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--border)}
+.row:first-of-type{border-top:none}
+.pdot{font:600 10px var(--mono);padding:2px 8px;border-radius:99px;flex-shrink:0}
+.bar{height:7px;background:rgba(255,255,255,.04);border-radius:99px;flex:1;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--grad);border-radius:99px;animation:barIn .8s cubic-bezier(.2,.8,.2,1) both}
+.mono{font-family:var(--mono)}
+.dim{color:var(--dim)} .faint{color:var(--faint)}
+.hot{color:var(--hot)} .cool{color:var(--cool)} .warm{color:var(--warm)}
+.big{font:700 26px var(--disp)}
+.search{width:100%;font:14px var(--body);padding:12px 16px;border-radius:10px;
+  border:1px solid var(--border);background:rgba(255,255,255,.03);color:var(--text);outline:none}
+.search:focus{border-color:var(--violet)}
+.chip{width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;
+  font:600 12px var(--mono);border-radius:6px;margin-left:4px}
+.mplist{max-height:560px;overflow-y:auto;padding-right:6px}
+.mpbtn{display:flex;justify-content:space-between;align-items:center;width:100%;text-align:left;
+  gap:8px;padding:10px 12px;border-radius:10px;cursor:pointer;background:transparent;
+  border:1px solid transparent;color:var(--dim);font:13px var(--body);transition:.12s}
+.mpbtn:hover{background:rgba(255,255,255,.04)}
+.mpbtn.on{background:rgba(124,107,255,.1);border-color:rgba(124,107,255,.5);color:var(--text)}
+.stat{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.stat .n{font:700 22px var(--disp)}
+.stat .l{font:600 9.5px var(--mono);letter-spacing:1px;color:var(--faint);margin-top:2px}
+.tip{cursor:help;border-bottom:1px dotted var(--faint)}
+footer{margin-top:40px;font-size:11.5px;color:var(--faint);line-height:1.7;max-width:820px}
+footer a{color:var(--dim)}
+*::-webkit-scrollbar{width:8px}*::-webkit-scrollbar-thumb{background:#2A3344;border-radius:4px}
+.empty{padding:60px 20px;text-align:center;color:var(--dim);font:15px var(--disp)}
+.growth{font:700 15px var(--mono)}
+spark{display:inline-block}
+</style>
+</head>
+<body>
+<div class="banner" id="banner" style="display:none">SAMPLE DATA — the engine has not run yet. Run the Backfill workflow on GitHub, then refresh.</div>
+<div class="wrap">
+  <header>
+    <div class="head">
+      <div>
+        <div class="eyebrow">WESTMINSTER ENGINE · PHASE ONE</div>
+        <h1>Westminster, decoded.</h1>
+        <p class="sub">Every question counted, every division tracked, all 650 MPs profiled.
+        Computed nightly from the official parliamentary record — opinion-free.</p>
+      </div>
+      <nav id="nav"></nav>
+    </div>
+  </header>
+  <main id="main"><div class="empty">Loading the record…</div></main>
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const PARTY = {Lab:"#FF6B5E",Con:"#5B9BFF",LD:"#FFC24D",RUK:"#3DD6E8",Ref:"#3DD6E8",
+  SNP:"#F5E663",Green:"#5ED97A",PC:"#4FCB8E",DUP:"#C77B96",SF:"#3E9E5F",SDLP:"#7FBF6B",
+  Alliance:"#F0D060",UUP:"#7E9FD4",TUV:"#9BB0D0",Ind:"#8A94A8",Spk:"#8A94A8"};
+const pcol = p => PARTY[p] || "#8A94A8";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+let DATA = {}, tab = "momentum", selMP = null, query = "";
+
+const TABS = [["momentum","Momentum"],["mps","MP intelligence"],["leagues","League tables"]];
+
+async function boot(){
+  const files = ["meta","mps","topics","leagues"];
+  for (const f of files){
+    try { DATA[f] = await (await fetch(`data/${f}.json?v=${Date.now()}`)).json(); }
+    catch(e){ DATA[f] = null; }
+  }
+  if (DATA.meta?.sample) document.getElementById("banner").style.display = "block";
+  document.getElementById("nav").innerHTML = TABS.map(([k,l]) =>
+    `<button data-t="${k}" class="${k===tab?"on":""}">${l}</button>`).join("");
+  document.getElementById("nav").onclick = e => {
+    const t = e.target.dataset.t; if(!t) return; tab = t; renderNav(); render();
+  };
+  renderFoot(); render();
+}
+function renderNav(){
+  document.querySelectorAll("nav button").forEach(b =>
+    b.classList.toggle("on", b.dataset.t === tab));
+}
+function pdot(p){ const c = pcol(p);
+  return `<span class="pdot" style="color:${c};border:1px solid ${c}44;background:${c}14">${esc(p)}</span>`; }
+function spark(values, color){
+  if(!values?.length) return "";
+  const W=120,H=30,max=Math.max(...values,1),min=Math.min(...values,0);
+  const pts = values.map((v,i)=>`${(i/(Math.max(1,values.length-1)))*W},${H-((v-min)/Math.max(1,max-min))*(H-6)-3}`).join(" ");
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round"/></svg>`;
+}
+
+/* ---------- MOMENTUM ---------- */
+function renderMomentum(){
+  const t = DATA.topics;
+  if(!t?.length) return `<div class="empty">No topic data yet — run the backfill on GitHub.</div>`;
+  return `<div class="grid" style="gap:12px">
+    <p class="dim" style="font-size:12.5px;max-width:760px">
+      Question subjects ranked by <span class="tip" title="Questions in the last ~90 days versus the previous ~90 days">quarter-on-quarter acceleration</span>,
+      not raw volume — "housing is big" is wallpaper; "this subject doubled in a quarter" is intelligence.</p>
+    ${t.map((x,i)=>`
+    <div class="panel">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px">
+        <div style="display:flex;align-items:baseline;gap:10px;min-width:0">
+          <span class="mono faint" style="font-size:12px">${String(i+1).padStart(2,"0")}</span>
+          <span style="font:700 17px var(--disp)">${esc(x.topic)}</span>
+          <span class="faint" style="font-size:11px">→ ${esc(x.body)}</span>
+        </div>
+        <span class="growth ${x.growth==null?"dim":x.growth>=0?"hot":"cool"}">
+          ${x.growth==null?"NEW":(x.growth>=0?"▲ ":"▼ ")+Math.abs(x.growth)+"%"}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+        <span class="mono faint" style="font-size:10px;width:64px">PREV QTR</span>
+        <div class="bar"><i style="width:${Math.min(100,100*x.prev/Math.max(x.cur,x.prev,1))}%;background:#3A4458"></i></div>
+        <span class="mono dim" style="font-size:11px;width:36px;text-align:right">${x.prev}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:4px">
+        <span class="mono faint" style="font-size:10px;width:64px">THIS QTR</span>
+        <div class="bar"><i style="width:${Math.min(100,100*x.cur/Math.max(x.cur,x.prev,1))}%"></i></div>
+        <span class="mono" style="font-size:11px;width:36px;text-align:right">${x.cur}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;align-items:center">
+        ${x.parties.map(([p,v])=>pdot(p)+`<span class="mono faint" style="font-size:10px;margin-right:6px">${v}%</span>`).join("")}
+        <span class="faint" style="font-size:11px;margin-left:auto">leading:
+          ${x.askers.slice(0,3).map(a=>esc(a.name)+" ("+a.n+")").join(" · ")}</span>
+      </div>
+    </div>`).join("")}
+  </div>`;
+}
+
+/* ---------- MPs ---------- */
+function renderMPs(){
+  const mps = DATA.mps;
+  if(!mps?.length) return `<div class="empty">No MP data yet — run the backfill on GitHub.</div>`;
+  const q = query.toLowerCase();
+  const list = mps.filter(m => !q || m.name.toLowerCase().includes(q) ||
+    (m.seat||"").toLowerCase().includes(q) || (m.party||"").toLowerCase()===q);
+  if(selMP==null || !mps.find(m=>m.id===selMP)) selMP = (list[0]||mps[0]).id;
+  const mp = mps.find(m=>m.id===selMP) || mps[0];
+  const c = pcol(mp.party);
+  const ratio = (mp.rebellions / Math.max(.5, mp.partyAvgReb)).toFixed(1);
+  const chips = (mp.form||[]).map(v=>{
+    const m={W:["✓","var(--cool)"],R:["✗","var(--hot)"],A:["–","var(--warm)"]}[v]||["?","var(--dim)"];
+    const t={W:"Voted with party majority",R:"Voted against party majority",A:"Did not vote"}[v]||"";
+    return `<span class="chip" title="${t}" style="color:${m[1]};background:color-mix(in srgb,${m[1]} 12%,transparent);border:1px solid color-mix(in srgb,${m[1]} 40%,transparent)">${m[0]}</span>`;
+  }).join("");
+  return `<div class="grid" style="grid-template-columns:280px 1fr;align-items:start">
+    <div>
+      <input class="search" placeholder="Search ${mps.length} MPs, seats, parties…" value="${esc(query)}"
+        oninput="query=this.value;render(true)">
+      <div class="mplist panel" style="margin-top:10px;padding:8px">
+        ${list.slice(0,400).map(m=>`
+          <button class="mpbtn ${m.id===selMP?"on":""}" onclick="selMP=${m.id};render()">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.name)}</span>
+            ${pdot(m.party)}
+          </button>`).join("") || `<div class="empty" style="padding:20px">No match</div>`}
+      </div>
+    </div>
+    <div class="panel" style="border-top:2px solid ${c}">
+      <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:14px;align-items:flex-start">
+        <div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font:700 24px var(--disp)">${esc(mp.name)}</span>${pdot(mp.party)}
+          </div>
+          <div class="dim" style="font-size:12.5px;margin-top:4px">${esc(mp.seat)}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="label" style="margin-bottom:6px">Last six divisions</div>
+          ${chips || '<span class="faint" style="font-size:11px">no votes recorded</span>'}
+        </div>
+      </div>
+      <div class="grid g3" style="margin-top:18px">
+        <div class="stat"><div class="n ${mp.rebellions>0&&ratio>=2?"hot":""}">${mp.rebellions}</div>
+          <div class="l"><span class="tip" title="Votes cast against the majority of their own party, in divisions where that party voted cohesively (≥60% one way, ≥10 voting)">REBELLIONS</span> · ${ratio}× PARTY AVG</div></div>
+        <div class="stat"><div class="n">${mp.participation}%</div>
+          <div class="l"><span class="tip" title="Share of all Commons divisions this parliament in which they cast a vote">DIVISION PARTICIPATION</span></div></div>
+        <div class="stat"><div class="n">${mp.questions}</div>
+          <div class="l"><span class="tip" title="Written parliamentary questions tabled this parliament">WRITTEN QUESTIONS</span>
+          <span style="float:right">${spark(mp.spark, "url(#g)") ? "" : ""}</span></div>
+          <div style="margin-top:6px">${spark(mp.spark, c)}</div></div>
+      </div>
+      <div style="margin-top:18px">
+        <div class="label">Question subjects · share of output
+          <span class="tip faint" title="Which government departments their written questions are addressed to">ⓘ</span></div>
+        ${(mp.topics||[]).map(([t,v])=>`
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:7px">
+            <span style="font-size:12px;width:230px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t)}</span>
+            <div class="bar"><i style="width:${v}%;background:${c}"></i></div>
+            <span class="mono dim" style="font-size:11px;width:34px;text-align:right">${v}%</span>
+          </div>`).join("") || '<span class="faint" style="font-size:12px">No questions tabled yet.</span>'}
+      </div>
+      <p class="faint" style="font-size:11px;margin-top:16px">
+        Phase one: pure counts from the official record. Tone, friendly fire, silence signals
+        and network analysis arrive in phase two.</p>
+    </div>
+  </div>`;
+}
+
+/* ---------- LEAGUES ---------- */
+function renderLeagues(){
+  const L = DATA.leagues;
+  if(!L) return `<div class="empty">No league data yet — run the backfill on GitHub.</div>`;
+  const block = (title, tipText, rows, fmt) => `
+    <div class="panel">
+      <div class="label"><span class="tip" title="${tipText}">${title}</span></div>
+      ${ (rows||[]).map((r,i)=>`
+        <div class="row">
+          <span class="mono faint" style="width:18px;font-size:11px">${i+1}</span>
+          ${pdot(r.party)}
+          <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">${esc(r.name)}</span>
+          <span class="mono" style="font-weight:600">${fmt(r)}</span>
+        </div>`).join("") || '<div class="faint" style="font-size:12px">Awaiting data.</div>'}
+    </div>`;
+  return `<div class="grid g3">
+    ${block("Independence index","Rebellions relative to their own party's average — measured this way because four rebellions in a tightly-whipped party mean far more than four in a loose one", L.independence, r=>r.v+"× <span class='faint'>("+r.raw+")</span>")}
+    ${block("Scrutiny volume","Written questions tabled this parliament", L.scrutiny, r=>r.v)}
+    ${block("Division presence","Share of all divisions voted in", L.presence, r=>r.v+"%")}
+  </div>`;
+}
+
+function render(keepFocus){
+  const m = document.getElementById("main");
+  m.innerHTML = tab==="momentum" ? renderMomentum()
+              : tab==="mps" ? renderMPs() : renderLeagues();
+  if(keepFocus){ const s=m.querySelector(".search"); if(s){s.focus();s.setSelectionRange(s.value.length,s.value.length);} }
+}
+function renderFoot(){
+  const meta = DATA.meta || {};
+  document.getElementById("foot").innerHTML = `
+    <strong style="color:var(--dim)">Methodology.</strong>
+    All data derives from the official record via the UK Parliament Members, Commons Votes and
+    Written Questions APIs. A "rebellion" means voting against the majority of the MP's own party
+    in a division where that party voted cohesively (at least 60% one way, at least 10 members voting) —
+    free votes therefore largely self-exclude. Participation counts tellers as not voting, and the
+    Speaker, Deputy Speakers and Sinn Féin do not vote by role or choice; their figures should be read
+    accordingly. Question subjects reflect the answering department. Nothing on this site is an opinion:
+    every figure is recomputed nightly from source.<br><br>
+    ${meta.sample ? "Showing sample data — the engine has not yet run." :
+      meta.updated ? `Last computed ${esc(meta.updated.slice(0,16).replace("T"," "))} UTC ·
+      ${meta.divisions||0} divisions · ${(meta.questions||0).toLocaleString()} questions ·
+      ${meta.mps||0} MPs` : "Awaiting first run."}
+    · Contains parliamentary information licensed under the
+    <a href="https://www.parliament.uk/site-information/copyright-parliament/open-parliament-licence/">Open Parliament Licence v3.0</a>.`;
+}
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+name: Backfill (run once, first)
+
+on:
+  workflow_dispatch: {}   # manual trigger only — the green "Run workflow" button
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run full backfill since 4 July 2024
+        run: python pipeline/run.py --mode backfill
+
+      - name: Commit data
+        run: |
+          git config user.name "engine-bot"
+          git config user.email "actions@github.com"
+          git add data/
+          git commit -m "Initial backfill $(date -u +%F)" || echo "nothing to commit"
+          git push

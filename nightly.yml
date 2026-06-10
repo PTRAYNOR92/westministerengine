@@ -1,0 +1,38 @@
+name: Nightly data update
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # 03:17 UTC every night
+  workflow_dispatch: {}     # also lets you run it manually with one click
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run nightly pipeline
+        run: python pipeline/run.py --mode nightly
+
+      - name: Commit updated data
+        run: |
+          git config user.name "engine-bot"
+          git config user.email "actions@github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "No changes tonight (recess day, most likely)."
+          else
+            git commit -m "Nightly data update $(date -u +%F)"
+            git push
+          fi
