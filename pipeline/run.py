@@ -20,6 +20,7 @@ Internal stores (the engine's memory between runs):
 """
 
 import argparse
+import html
 import json
 import os
 import sys
@@ -145,47 +146,74 @@ def fetch_divisions(state, votes):
 
 
 # ---------------------------------------------------------------- questions
+def month_windows(frm_str):
+    """Yield (from, to) ISO date pairs, one per calendar month, frm → today.
+
+    The WQ API silently truncates very large queries (a 2-year window dies
+    after ~500 results), so we always fetch in month-sized chunks instead.
+    """
+    cur = datetime.strptime(frm_str, "%Y-%m-%d").date()
+    today = date.today()
+    while cur <= today:
+        nxt = date(cur.year + 1, 1, 1) if cur.month == 12 else \
+            date(cur.year, cur.month + 1, 1)
+        yield cur.isoformat(), min(nxt - timedelta(days=1), today).isoformat()
+        cur = nxt
+
+
 def fetch_questions(state, q_monthly, mp_q, mode):
     print("Fetching written questions…")
     frm = START_OF_PARLIAMENT if mode == "backfill" else \
         state.get("last_question_date", START_OF_PARLIAMENT)
-    skip, total = 0, 0
+    total = 0
     latest = frm
-    while True:
-        j = get(WQ_URL, {"tabledWhenFrom": frm, "take": 100, "skip": skip,
-                         "house": "Commons"})
-        if not j:
-            break
-        results = j.get("results") or []
-        if not results:
-            break
-        for r in results:
-            v = r.get("value") or {}
-            mid = v.get("askingMemberId")
-            tabled = (v.get("dateTabled") or "")[:10]
-            heading = (v.get("heading") or "Unclassified").strip()[:80]
-            body = (v.get("answeringBodyName") or "Unknown").strip()[:60]
-            if not mid or not tabled:
-                continue
-            month = tabled[:7]
-            qm = q_monthly.setdefault(month, {})
-            h = qm.setdefault(heading, {"n": 0, "members": {}, "body": body})
-            h["n"] += 1
-            h["members"][str(mid)] = h["members"].get(str(mid), 0) + 1
-            mq = mp_q.setdefault(str(mid), {"total": 0, "months": {}, "bodies": {}})
-            mq["total"] += 1
-            mq["months"][month] = mq["months"].get(month, 0) + 1
-            mq["bodies"][body] = mq["bodies"].get(body, 0) + 1
-            if tabled > latest:
-                latest = tabled
-            total += 1
-        skip += 100
-        if skip >= j.get("totalResults", 0):
-            break
-        if skip % 5000 == 0:
-            print(f"  …{skip} questions so far")
-    # overlap a few days so nothing slips between runs (dedupe is approximate
-    # at the aggregate level; a 2-day overlap on nightly runs is negligible)
+    for w_from, w_to in month_windows(frm):
+        skip, win_total, reported = 0, 0, None
+        while True:
+            j = get(WQ_URL, {"tabledWhenFrom": w_from, "tabledWhenTo": w_to,
+                             "take": 100, "skip": skip, "house": "Commons"})
+            if not j:
+                print(f"  WARNING: fetch died in window {w_from}→{w_to} "
+                      f"at skip={skip} — window incomplete")
+                break
+            if reported is None:
+                reported = j.get("totalResults", 0)
+            results = j.get("results") or []
+            if not results:
+                break
+            for r in results:
+                v = r.get("value") or {}
+                mid = v.get("askingMemberId")
+                tabled = (v.get("dateTabled") or "")[:10]
+                heading = html.unescape(
+                    (v.get("heading") or "Unclassified")).strip()[:80]
+                body = html.unescape(
+                    (v.get("answeringBodyName") or "Unknown")).strip()[:60]
+                if not mid or not tabled:
+                    continue
+                month = tabled[:7]
+                qm = q_monthly.setdefault(month, {})
+                h = qm.setdefault(heading, {"n": 0, "members": {}, "body": body})
+                h["n"] += 1
+                h["members"][str(mid)] = h["members"].get(str(mid), 0) + 1
+                mq = mp_q.setdefault(str(mid),
+                                     {"total": 0, "months": {}, "bodies": {}})
+                mq["total"] += 1
+                mq["months"][month] = mq["months"].get(month, 0) + 1
+                mq["bodies"][body] = mq["bodies"].get(body, 0) + 1
+                if tabled > latest:
+                    latest = tabled
+                win_total += 1
+            skip += 100
+            if skip >= (reported or 0):
+                break
+        flag = "" if reported is not None and win_total >= reported \
+            else "  ← SHORT, check this window"
+        print(f"  {w_from} → {w_to}: {win_total} questions "
+              f"(API reported {reported}){flag}")
+        total += win_total
+    # overlap a day so nothing slips between runs (dedupe is approximate
+    # at the aggregate level; a 1-day overlap on nightly runs is negligible)
     state["last_question_date"] = (
         datetime.strptime(latest, "%Y-%m-%d") - timedelta(days=1)
     ).date().isoformat() if total else state.get("last_question_date", frm)
