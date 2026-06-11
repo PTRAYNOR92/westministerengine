@@ -120,15 +120,36 @@ def _current_post(posts):
     return ""
 
 
-def fetch_roles(members, prev):
+def _rotation_slice(members, prev, mode):
+    """Which MPs to refresh tonight for the slow per-MP endpoints.
+
+    Backfill: everyone. Nightly: a rotating seventh of the House (so every
+    MP refreshes at least weekly) plus anyone not seen before. These fields
+    drift slowly, and skipping six-sevenths of 647 slow API calls is what
+    keeps the nightly run fast.
+    """
+    if mode == "backfill":
+        return set(members)
+    bucket = date.today().toordinal() % 7
+    return {mid for mid in members
+            if int(mid) % 7 == bucket or mid not in prev}
+
+
+def fetch_roles(members, prev, mode):
     """Current government/opposition post per MP, from the Members API.
 
-    One call per MP; failures fall back to the previous run's value so a
-    flaky night never blanks the site.
+    One call per MP in tonight's rotation slice; everyone else (and any
+    failure) carries the previous run's value so a flaky night never
+    blanks the site.
     """
-    print("Fetching roles…")
+    todo = _rotation_slice(members, prev, mode)
+    print(f"Fetching roles… ({len(todo)} of {len(members)} tonight)")
     fails = 0
     for mid, m in members.items():
+        if mid not in todo:
+            old = prev.get(mid, {})
+            m["role"], m["roleType"] = old.get("role", ""), old.get("roleType", "")
+            continue
         j = get(BIO_URL.format(mid))
         if not j:
             old = prev.get(mid, {})
@@ -147,15 +168,19 @@ def fetch_roles(members, prev):
     print(f"  roles done ({fails} fallbacks)" if fails else "  roles done")
 
 
-def fetch_spoken(members, prev):
+def fetch_spoken(members, prev, mode):
     """Count of spoken Hansard contributions this parliament, per MP.
 
-    Uses the Hansard search API's result count (take=1 keeps it cheap).
-    Failures fall back to the previous run's value.
+    The Hansard search API is the slowest thing we touch, so only tonight's
+    rotation slice is refreshed; everyone else carries the previous value.
     """
-    print("Fetching spoken contributions…")
+    todo = _rotation_slice(members, prev, mode)
+    print(f"Fetching spoken contributions… ({len(todo)} of {len(members)} tonight)")
     fails = 0
     for mid, m in members.items():
+        if mid not in todo:
+            m["spoken"] = prev.get(mid, {}).get("spoken", 0)
+            continue
         j = get(HANSARD_URL, {"queryParameters.memberId": mid,
                               "queryParameters.startDate": START_OF_PARLIAMENT,
                               "queryParameters.take": 1})
@@ -641,8 +666,26 @@ def compute(members, votes, q_monthly, mp_q):
                             )[:15] if r["rebellions"] > 0],
         "scrutiny": league(lambda m: m["questions"]),
         "voice": league(lambda m: m["spoken"]),
-        "presence": league(lambda m: m["participation"]),
-    }
+        "presence": league(lambda m: m["participation"]),    }
+
+    # policy-area leaderboards: top askers per answering department,
+    # straight from counts already gathered — no AI involved
+    dept_totals = defaultdict(int)
+    dept_mps = defaultdict(list)
+    name_of = {str(m["id"]): m for m in mps_out}
+    for mid, mq in mp_q.items():
+        m = name_of.get(mid)
+        if not m:
+            continue
+        for body, n in (mq.get("bodies") or {}).items():
+            dept_totals[body] += n
+            dept_mps[body].append({"name": m["name"], "party": m["party"],
+                                   "seat": m["seat"], "n": n})
+    top_depts = sorted(dept_totals, key=lambda b: -dept_totals[b])[:16]
+    leagues["policy"] = {
+        body: {"total": dept_totals[body],
+               "top": sorted(dept_mps[body], key=lambda r: -r["n"])[:10]}
+        for body in top_depts}
 
     save("mps.json", mps_out)
     save("topics.json", topics_out)
@@ -677,8 +720,8 @@ def main():
 
     prev = {str(m.get("id")): m for m in load("mps.json", [])
             if isinstance(m, dict)}
-    fetch_roles(members, prev)
-    fetch_spoken(members, prev)
+    fetch_roles(members, prev, mode)
+    fetch_spoken(members, prev, mode)
 
     fetch_divisions(state, votes)
     fetch_questions(state, q_monthly, mp_q, mode)
