@@ -41,6 +41,9 @@ UA = {"User-Agent": "westminster-engine/1.0 (open data project)"}
 MEMBERS_URL = "https://members-api.parliament.uk/api/Members/Search"
 BIO_URL = "https://members-api.parliament.uk/api/Members/{}/Biography"
 HANSARD_URL = "https://hansard-api.parliament.uk/search/contributions/Spoken.json"
+HANSARD_DEB_SEARCH = "https://hansard-api.parliament.uk/search/debates/debatesearch.json"
+HANSARD_DEBATE = "https://hansard-api.parliament.uk/debates/debate/{}.json"
+DEBATE_WINDOW_DAYS = 190  # how far back the debate layer looks/keeps
 DIV_SEARCH = "https://commonsvotes-api.parliament.uk/data/divisions.json/search"
 DIV_ONE = "https://commonsvotes-api.parliament.uk/data/division/{}.json"
 WQ_URL = "https://questions-statements-api.parliament.uk/api/writtenquestions/questions"
@@ -523,6 +526,149 @@ def ai_mp_themes(mps_out, mp_q):
     print(f"MP themes: {done}/{len(todo)} generated this run")
 
 
+# ---------------------------------------------------------------- debates
+def _ci(d, *names):
+    """Case-tolerant dict get — Hansard's JSON casing is inconsistent."""
+    for n in names:
+        if n in d:
+            return d[n]
+        for k in d:
+            if k.lower() == n.lower():
+                return d[k]
+    return None
+
+
+def fetch_debates(state, debates):
+    """Debate sections (Commons Chamber + Westminster Hall) with per-MP
+    contribution counts. Covers debates, bill stages, oral questions,
+    urgent questions, statements — anything spoken on the floor.
+
+    Incremental by ext id: already-stored sections are never refetched, so
+    the first run does the ~6-month catch-up and nightly runs only fetch
+    the latest sitting day. Entries older than the window are pruned.
+    """
+    frm = state.get("last_debate_date") or \
+        (date.today() - timedelta(days=DEBATE_WINDOW_DAYS)).isoformat()
+    print(f"Fetching debate sections since {frm}…")
+    skip, found, fetched, latest = 0, 0, 0, frm
+    while True:
+        j = get(HANSARD_DEB_SEARCH, {
+            "queryParameters.startDate": frm,
+            "queryParameters.endDate": date.today().isoformat(),
+            "queryParameters.house": "Commons",
+            "queryParameters.take": 100, "queryParameters.skip": skip})
+        if not j:
+            print(f"  WARNING: debate search died at skip={skip}")
+            break
+        results = _ci(j, "Results") or []
+        if not results:
+            break
+        for r in results:
+            ext = _ci(r, "DebateSectionExtId")
+            title = html.unescape(str(_ci(r, "Title") or "")).strip()[:110]
+            sdate = str(_ci(r, "SittingDate") or "")[:10]
+            found += 1
+            if sdate > latest:
+                latest = sdate
+            if not ext or ext in debates or not title:
+                continue
+            dj = get(HANSARD_DEBATE.format(ext))
+            if not dj:
+                continue
+            sp = defaultdict(int)
+            for item in (_ci(dj, "Items") or []):
+                if not isinstance(item, dict):
+                    continue
+                if str(_ci(item, "ItemType") or "") != "Contribution":
+                    continue
+                mid = _ci(item, "MemberId")
+                if mid:
+                    sp[str(mid)] += 1
+            if not sp:
+                continue  # container/procedural section with no speech
+            debates[ext] = {"d": sdate, "t": title, "sp": dict(sp)}
+            fetched += 1
+        skip += 100
+        total = _ci(j, "TotalResultCount") or _ci(j, "TotalResults") or 0
+        if skip >= int(total or 0):
+            break
+    # refetch overlap of a couple of days; prune beyond the window
+    state["last_debate_date"] = (
+        datetime.strptime(latest, "%Y-%m-%d")
+        - timedelta(days=2)).date().isoformat() if (fetched or found) else frm
+    floor = (date.today() - timedelta(days=DEBATE_WINDOW_DAYS)).isoformat()
+    for k in [k for k, e in debates.items() if e.get("d", "") < floor]:
+        del debates[k]
+    print(f"  {found} sections seen, {fetched} new with speech, "
+          f"{len(debates)} held")
+
+
+def ai_tag_debates(debates, headings, depts):
+    """Map each untagged debate section onto the site's topic vocabulary
+    and a department, via batched API calls. Tags are stored on the entry
+    so each section is only ever read once. Procedural business is tagged
+    'Procedural' and excluded from momentum downstream."""
+    todo = [(k, e) for k, e in debates.items() if "topic" not in e]
+    if not todo:
+        print("Debate tags: all up to date")
+        return
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        print(f"Debate tags: no key — {len(todo)} sections untagged")
+        return
+    todo = todo[:900]
+    print(f"Debate tags: tagging {len(todo)} sections…")
+    done = 0
+    for i in range(0, len(todo), 40):
+        batch = todo[i:i + 40]
+        payload = [{"id": k, "title": e["t"], "date": e["d"]}
+                   for k, e in batch]
+        prompt = (
+            "You are tagging UK House of Commons debate sections for a "
+            "parliamentary data site. For each section below, return:\n"
+            '- "topic": the policy subject. REUSE one of these existing '
+            "topic strings whenever one fits (exact string): "
+            + json.dumps(headings[:60]) + ". Only if none fits, coin a "
+            'concise topic of 2-5 plain words. Use exactly "Procedural" '
+            "for points of order, business of the house, petitions "
+            "presentations, and similar non-policy business.\n"
+            '- "dept": the most relevant department from this list (exact '
+            'string), or "Other": ' + json.dumps(depts) + "\n"
+            "Respond with ONLY a JSON array, no markdown fences, of "
+            '{"id": "<id>", "topic": "...", "dept": "..."}.\n\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        try:
+            r = requests.post(ANTHROPIC_URL, timeout=180, headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }, json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 8000,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            if r.status_code != 200:
+                print(f"Debate tags: HTTP {r.status_code} on batch — skipping")
+                continue
+            text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                           if b.get("type") == "text")
+            text = text.strip().removeprefix("```json").removeprefix("```") \
+                       .removesuffix("```").strip()
+            tags = {g["id"]: g for g in json.loads(text)
+                    if isinstance(g, dict) and g.get("id")}
+        except Exception as e:
+            print(f"Debate tags: batch failed ({e}) — skipping")
+            continue
+        for k, e in batch:
+            g = tags.get(k)
+            if g and g.get("topic"):
+                e["topic"] = str(g["topic"])[:60]
+                e["dept"] = str(g.get("dept") or "Other")[:60]
+                done += 1
+    print(f"Debate tags: {done}/{len(todo)} tagged this run")
+
+
 # ---------------------------------------------------------------- compute
 def party_majorities(votes, members):
     """For each division, which side did each party's majority take?"""
@@ -549,7 +695,31 @@ def party_majorities(votes, members):
     return out
 
 
-def compute(members, votes, q_monthly, mp_q):
+def compute(members, votes, q_monthly, mp_q, debates):
+    # debate aggregates: per-topic momentum buckets, per-MP speaking,
+    # per-department speakers — all from contribution counts
+    today = date.today()
+    cur_months = {(today - timedelta(days=i * 30)).isoformat()[:7] for i in range(3)}
+    prev_months = {(today - timedelta(days=(i + 3) * 30)).isoformat()[:7] for i in range(3)}
+    deb_agg = defaultdict(lambda: {"cur": 0, "prev": 0})
+    dept_speak = defaultdict(lambda: defaultdict(int))
+    mp_speak = defaultdict(lambda: defaultdict(int))
+    for e in debates.values():
+        topic = e.get("topic")
+        if not topic or topic == "Procedural":
+            continue
+        month = e.get("d", "")[:7]
+        bucket = "cur" if month in cur_months else \
+            "prev" if month in prev_months else None
+        n = sum(e.get("sp", {}).values())
+        if bucket:
+            deb_agg[topic][bucket] += n
+        dept = e.get("dept") or ""
+        for mid, c in e.get("sp", {}).items():
+            mp_speak[mid][topic] += c
+            if dept and dept != "Other":
+                dept_speak[dept][mid] += c
+
     print("Computing site data…")
     majors = party_majorities(votes, members)
     ordered = sorted(votes.items(), key=lambda kv: kv[1]["date"])
@@ -601,16 +771,16 @@ def compute(members, votes, q_monthly, mp_q):
             "partyAvgReb": round(party_avg.get(s["party"], 0), 1),
             "form": s["form"][-6:],
             "questions": q["total"],
+            "speaking": sorted(mp_speak.get(mid, {}).items(),
+                               key=lambda kv: -kv[1])[:3],
             "spark": [q["months"].get(mo, 0) for mo in months],
             "topics": [[b, round(100 * v / bsum)] for b, v in bodies],
         })
     mps_out.sort(key=lambda m: m["name"])
     ai_mp_themes(mps_out, mp_q)
 
-    # topic momentum: last 90 days vs previous 90, by question heading
-    today = date.today()
-    cur_months = {(today - timedelta(days=i * 30)).isoformat()[:7] for i in range(3)}
-    prev_months = {(today - timedelta(days=(i + 3) * 30)).isoformat()[:7] for i in range(3)}
+    # topic momentum: last 90 days vs previous 90 — questions + debate
+    # contributions combined (month buckets defined at top of compute)
     agg = defaultdict(lambda: {"cur": 0, "prev": 0, "members": defaultdict(int), "body": ""})
     for month, headings in q_monthly.items():
         bucket = "cur" if month in cur_months else "prev" if month in prev_months else None
@@ -624,10 +794,15 @@ def compute(members, votes, q_monthly, mp_q):
                 a["members"][mem] += c
 
     topics_out = []
-    for heading, a in agg.items():
-        if a["cur"] < 12:
+    for heading in set(agg) | set(deb_agg):
+        a = agg.get(heading) or \
+            {"cur": 0, "prev": 0, "members": {}, "body": ""}
+        d = deb_agg.get(heading, {"cur": 0, "prev": 0})
+        cur = a["cur"] + d["cur"]
+        prev = a["prev"] + d["prev"]
+        if cur < 12:
             continue
-        growth = round(100 * (a["cur"] - a["prev"]) / a["prev"]) if a["prev"] >= 5 else None
+        growth = round(100 * (cur - prev) / prev) if prev >= 5 else None
         parties, askers = defaultdict(int), []
         for mem, c in sorted(a["members"].items(), key=lambda kv: -kv[1])[:6]:
             m = members.get(mem)
@@ -640,7 +815,8 @@ def compute(members, votes, q_monthly, mp_q):
         psum = sum(parties.values()) or 1
         topics_out.append({
             "topic": heading, "body": a["body"],
-            "cur": a["cur"], "prev": a["prev"], "growth": growth,
+            "cur": cur, "prev": prev, "growth": growth,
+            "qcur": a["cur"], "dcur": d["cur"],
             "parties": sorted(
                 [[p, round(100 * c / psum)] for p, c in parties.items()],
                 key=lambda x: -x[1])[:5],
@@ -684,7 +860,14 @@ def compute(members, votes, q_monthly, mp_q):
     top_depts = sorted(dept_totals, key=lambda b: -dept_totals[b])[:16]
     leagues["policy"] = {
         body: {"total": dept_totals[body],
-               "top": sorted(dept_mps[body], key=lambda r: -r["n"])[:10]}
+               "top": sorted(dept_mps[body], key=lambda r: -r["n"])[:10],
+               "speakers": [
+                   {"name": name_of[mid]["name"],
+                    "party": name_of[mid]["party"],
+                    "seat": name_of[mid]["seat"], "n": c}
+                   for mid, c in sorted(dept_speak.get(body, {}).items(),
+                                        key=lambda kv: -kv[1])[:10]
+                   if mid in name_of]}
         for body in top_depts}
 
     save("mps.json", mps_out)
@@ -726,6 +909,18 @@ def main():
     fetch_divisions(state, votes)
     fetch_questions(state, q_monthly, mp_q, mode)
 
+    debates = load("debates.json", {})
+    fetch_debates(state, debates)
+    top_headings = sorted(
+        {h for m in q_monthly.values() for h in m},
+        key=lambda h: -sum(m.get(h, {}).get("n", 0) for m in q_monthly.values()))
+    top_depts_for_ai = sorted(
+        {b for mq in mp_q.values() for b in (mq.get("bodies") or {})},
+        key=lambda b: -sum((mq.get("bodies") or {}).get(b, 0)
+                           for mq in mp_q.values()))[:16]
+    ai_tag_debates(debates, top_headings, top_depts_for_ai)
+    save("debates.json", debates)
+
     # drop AI-gloss sample texts from months too old to trend
     keep = {(date.today() - timedelta(days=i * 30)).isoformat()[:7]
             for i in range(5)}
@@ -745,7 +940,7 @@ def main():
             if not mq["ex"]:
                 del mq["ex"]
 
-    compute(members, votes, q_monthly, mp_q)
+    compute(members, votes, q_monthly, mp_q, debates)
 
     save("state.json", state)
     save("votes.json", votes)
