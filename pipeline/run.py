@@ -20,6 +20,7 @@ Internal stores (the engine's memory between runs):
 """
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -31,6 +32,9 @@ from datetime import date, datetime, timedelta
 import requests
 
 START_OF_PARLIAMENT = "2024-07-04"
+THEME_WINDOW_DAYS = 183   # "what they're pursuing" looks at the last ~6 months
+THEME_KEEP = 30           # max question texts kept per MP
+THEME_BATCH_CAP = 200     # max MP summaries regenerated per night
 DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 UA = {"User-Agent": "westminster-engine/1.0 (open data project)"}
 
@@ -229,6 +233,8 @@ def fetch_questions(state, q_monthly, mp_q, mode):
         state.get("last_question_date", START_OF_PARLIAMENT)
     total = 0
     latest = frm
+    sample_cutoff = (date.today() - timedelta(days=130)).isoformat()
+    theme_cutoff = (date.today() - timedelta(days=THEME_WINDOW_DAYS + 7)).isoformat()
     for w_from, w_to in month_windows(frm):
         skip, win_total, reported = 0, 0, None
         while True:
@@ -254,15 +260,25 @@ def fetch_questions(state, q_monthly, mp_q, mode):
                 if not mid or not tabled:
                     continue
                 month = tabled[:7]
+                qtext = html.unescape(
+                    (v.get("questionText") or "")).strip()[:240]
                 qm = q_monthly.setdefault(month, {})
                 h = qm.setdefault(heading, {"n": 0, "members": {}, "body": body})
                 h["n"] += 1
+                # keep a few raw question texts for the AI gloss (recent only)
+                if tabled >= sample_cutoff and qtext \
+                        and len(h.setdefault("ex", [])) < 3:
+                    h["ex"].append(qtext)
                 h["members"][str(mid)] = h["members"].get(str(mid), 0) + 1
                 mq = mp_q.setdefault(str(mid),
                                      {"total": 0, "months": {}, "bodies": {}})
                 mq["total"] += 1
                 mq["months"][month] = mq["months"].get(month, 0) + 1
                 mq["bodies"][body] = mq["bodies"].get(body, 0) + 1
+                # keep their recent question texts for the AI theme reader
+                if tabled >= theme_cutoff and qtext:
+                    mq.setdefault("ex", []).append(
+                        {"d": tabled, "t": qtext[:200]})
                 if tabled > latest:
                     latest = tabled
                 win_total += 1
@@ -281,6 +297,205 @@ def fetch_questions(state, q_monthly, mp_q, mode):
     ).date().isoformat() if total else state.get("last_question_date", frm)
     print(f"  {total} questions ingested")
     return total
+
+
+# ---------------------------------------------------------------- ai gloss
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+
+def ai_glosses(topics_out, q_monthly):
+    """One plain-English line per trending subject, written by Claude.
+
+    Single API call for all topics. Needs ANTHROPIC_API_KEY in the
+    environment; without it (or on any failure) the site simply renders
+    without glosses — never blocks the pipeline.
+    """
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        print("AI gloss: no ANTHROPIC_API_KEY set — skipping (site still works)")
+        return
+    print("AI gloss: generating…")
+
+    # gather sample question texts per heading from recent months
+    samples = defaultdict(list)
+    for month in sorted(q_monthly, reverse=True)[:5]:
+        for heading, h in q_monthly[month].items():
+            for ex in h.get("ex", []):
+                if len(samples[heading]) < 4:
+                    samples[heading].append(ex)
+
+    items = []
+    for t in topics_out:
+        items.append({
+            "topic": t["topic"],
+            "department": t["body"],
+            "growth_pct": t["growth"],
+            "questions_this_quarter": t["cur"],
+            "top_askers": [f'{a["name"]} ({a["party"]})'
+                           for a in t["askers"][:3]],
+            "sample_questions": samples.get(t["topic"], []),
+        })
+
+    prompt = (
+        "You are writing one-line editorial glosses for a UK parliamentary "
+        "data site. For each subject below — a written-question filing "
+        "heading that is trending in the Commons — write ONE sentence "
+        "(max 25 words) explaining in plain English what MPs are actually "
+        "probing, based on the sample questions. Be specific and factual; "
+        "name the issue, not the filing label. No opinions, no speculation "
+        "beyond what the samples support. If samples are empty, infer "
+        "cautiously from the heading and department alone and stay vague "
+        "rather than guess.\n\n"
+        "Respond with ONLY a JSON array, no markdown fences, of objects "
+        '{"topic": "<exact topic string>", "gloss": "<sentence>"}.\n\n'
+        + json.dumps(items, ensure_ascii=False)
+    )
+
+    try:
+        r = requests.post(ANTHROPIC_URL, timeout=120, headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }, json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 4000,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        if r.status_code != 200:
+            print(f"AI gloss: HTTP {r.status_code} — skipping ({r.text[:200]})")
+            return
+        text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                       if b.get("type") == "text")
+        text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        glosses = {g["topic"]: g["gloss"] for g in json.loads(text)
+                   if isinstance(g, dict) and g.get("topic") and g.get("gloss")}
+    except Exception as e:
+        print(f"AI gloss: failed ({e}) — skipping, site still works")
+        return
+
+    hit = 0
+    for t in topics_out:
+        if t["topic"] in glosses:
+            t["gloss"] = str(glosses[t["topic"]])[:220]
+            hit += 1
+    print(f"AI gloss: {hit}/{len(topics_out)} topics glossed")
+
+
+def ai_mp_themes(mps_out, mp_q):
+    """Per-MP 'what they're pursuing': top 3 themes with a stance line each,
+    plus behavioural counts of their recent written questions.
+
+    Cached by content signature in data/mp_glosses.json — an MP is only
+    re-read when their question set changes, so steady-state cost is pennies.
+    Capped at THEME_BATCH_CAP regenerations per night; the rest catch up on
+    following nights. No key / API failure → cached values still render.
+    """
+    cache = load("mp_glosses.json", {})
+    cutoff = (date.today() - timedelta(days=THEME_WINDOW_DAYS)).isoformat()
+
+    todo = []
+    for m in mps_out:
+        mid = str(m["id"])
+        ex = [e for e in mp_q.get(mid, {}).get("ex", [])
+              if isinstance(e, dict) and e.get("d", "") >= cutoff]
+        ex = sorted(ex, key=lambda e: e["d"])[-THEME_KEEP:]
+        if len(ex) < 5:
+            continue  # too few questions to theme honestly
+        sig = hashlib.md5("|".join(e["t"] for e in ex)
+                          .encode("utf-8")).hexdigest()[:12]
+        c = cache.get(mid)
+        if c and c.get("sig") == sig and c.get("themes"):
+            m["themes"], m["approach"] = c["themes"], c.get("approach", {})
+            m["themeN"] = c.get("n", len(ex))
+        else:
+            todo.append((m, ex, sig))
+
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        print(f"MP themes: no key — {len(todo)} pending, cached ones still shown")
+        return
+    if not todo:
+        print("MP themes: all up to date from cache")
+        return
+    todo = todo[:THEME_BATCH_CAP]
+    print(f"MP themes: generating for {len(todo)} MPs…")
+
+    done = 0
+    for i in range(0, len(todo), 20):
+        batch = todo[i:i + 20]
+        payload = [{"id": m["id"], "name": m["name"], "party": m["party"],
+                    "role": m.get("role", ""),
+                    "questions": [e["t"] for e in ex]}
+                   for m, ex, _ in batch]
+        prompt = (
+            "You are analysing UK MPs' written parliamentary questions for a "
+            "data site. For each MP below, using ONLY their listed questions:\n"
+            "1. themes: their top 1-3 subjects (most prominent first). Each "
+            'has "subject" (2-5 plain words), "stance" (max 14 words on what '
+            "they are doing about it — e.g. 'pressing the government over "
+            "delays to compensation payments', 'seeking detail on funding "
+            "allocations'; describe conduct, never characterise the person), "
+            'and "eg" (the 0-based index of one listed question that best '
+            "shows the theme).\n"
+            '2. approach: count EVERY listed question into exactly one of: '
+            '"pressing" (demanding action, challenging, chasing failures), '
+            '"probing" (seeking information or detail), '
+            '"constituency" (local casework framing), '
+            '"supportive" (inviting good news, friendly prompts).\n'
+            "Ground everything in the question texts. Respond with ONLY a "
+            "JSON array, no markdown fences, of objects "
+            '{"id": <id>, "themes": [...], "approach": {...}}.\n\n'
+            + json.dumps(payload, ensure_ascii=False)
+        )
+        try:
+            r = requests.post(ANTHROPIC_URL, timeout=180, headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }, json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 8000,
+                "messages": [{"role": "user", "content": prompt}],
+            })
+            if r.status_code != 200:
+                print(f"MP themes: HTTP {r.status_code} on batch — skipping")
+                continue
+            text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                           if b.get("type") == "text")
+            text = text.strip().removeprefix("```json").removeprefix("```") \
+                       .removesuffix("```").strip()
+            results = {int(g["id"]): g for g in json.loads(text)
+                       if isinstance(g, dict) and g.get("id") is not None}
+        except Exception as e:
+            print(f"MP themes: batch failed ({e}) — skipping")
+            continue
+        for m, ex, sig in batch:
+            g = results.get(m["id"])
+            if not g or not isinstance(g.get("themes"), list):
+                continue
+            themes = []
+            for t in g["themes"][:3]:
+                if not (isinstance(t, dict) and t.get("subject")
+                        and t.get("stance")):
+                    continue
+                th = {"subject": str(t["subject"])[:60],
+                      "stance": str(t["stance"])[:120]}
+                idx = t.get("eg")
+                if isinstance(idx, int) and 0 <= idx < len(ex):
+                    th["example"] = ex[idx]["t"]
+                themes.append(th)
+            if not themes:
+                continue
+            approach = {k: int(v) for k, v in (g.get("approach") or {}).items()
+                        if k in ("pressing", "probing", "constituency",
+                                 "supportive") and isinstance(v, (int, float))}
+            m["themes"], m["approach"], m["themeN"] = themes, approach, len(ex)
+            cache[str(m["id"])] = {"sig": sig, "themes": themes,
+                                   "approach": approach, "n": len(ex),
+                                   "made": date.today().isoformat()}
+            done += 1
+    save("mp_glosses.json", cache)
+    print(f"MP themes: {done}/{len(todo)} generated this run")
 
 
 # ---------------------------------------------------------------- compute
@@ -365,6 +580,7 @@ def compute(members, votes, q_monthly, mp_q):
             "topics": [[b, round(100 * v / bsum)] for b, v in bodies],
         })
     mps_out.sort(key=lambda m: m["name"])
+    ai_mp_themes(mps_out, mp_q)
 
     # topic momentum: last 90 days vs previous 90, by question heading
     today = date.today()
@@ -408,6 +624,7 @@ def compute(members, votes, q_monthly, mp_q):
     topics_out.sort(key=lambda t: (-(t["growth"] if t["growth"] is not None else -999),
                                    -t["cur"]))
     topics_out = topics_out[:40]
+    ai_glosses(topics_out, q_monthly)
 
     def league(keyfn, n=15, reverse=True):
         rows = sorted(mps_out, key=keyfn, reverse=reverse)[:n]
@@ -465,6 +682,26 @@ def main():
 
     fetch_divisions(state, votes)
     fetch_questions(state, q_monthly, mp_q, mode)
+
+    # drop AI-gloss sample texts from months too old to trend
+    keep = {(date.today() - timedelta(days=i * 30)).isoformat()[:7]
+            for i in range(5)}
+    for month, headings in q_monthly.items():
+        if month not in keep:
+            for h in headings.values():
+                h.pop("ex", None)
+    # trim per-MP question texts to the theme window and cap
+    theme_floor = (date.today()
+                   - timedelta(days=THEME_WINDOW_DAYS + 7)).isoformat()
+    for mq in mp_q.values():
+        if "ex" in mq:
+            mq["ex"] = sorted(
+                (e for e in mq["ex"]
+                 if isinstance(e, dict) and e.get("d", "") >= theme_floor),
+                key=lambda e: e["d"])[-THEME_KEEP:]
+            if not mq["ex"]:
+                del mq["ex"]
+
     compute(members, votes, q_monthly, mp_q)
 
     save("state.json", state)
