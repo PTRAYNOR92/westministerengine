@@ -429,16 +429,19 @@ def ai_mp_themes(mps_out, mp_q):
         ex = [e for e in mp_q.get(mid, {}).get("ex", [])
               if isinstance(e, dict) and e.get("d", "") >= cutoff]
         ex = sorted(ex, key=lambda e: e["d"])[-THEME_KEEP:]
-        if len(ex) < 5:
-            continue  # too few questions to theme honestly
-        sig = hashlib.md5("|".join(e["t"] for e in ex)
+        dx = [e for e in mp_q.get(mid, {}).get("deb_ex", [])
+              if isinstance(e, dict) and e.get("d", "") >= cutoff]
+        dx = sorted(dx, key=lambda e: e["d"])[-12:]
+        if len(ex) + len(dx) < 5:
+            continue  # too little material to theme honestly
+        sig = hashlib.md5("|".join(e["t"] for e in ex + dx)
                           .encode("utf-8")).hexdigest()[:12]
         c = cache.get(mid)
         if c and c.get("sig") == sig and c.get("themes"):
             m["themes"], m["approach"] = c["themes"], c.get("approach", {})
             m["themeN"] = c.get("n", len(ex))
         else:
-            todo.append((m, ex, sig))
+            todo.append((m, ex, dx, sig))
 
     key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key:
@@ -455,24 +458,31 @@ def ai_mp_themes(mps_out, mp_q):
         batch = todo[i:i + 20]
         payload = [{"id": m["id"], "name": m["name"], "party": m["party"],
                     "role": m.get("role", ""),
-                    "questions": [e["t"] for e in ex]}
-                   for m, ex, _ in batch]
+                    "written_questions": [e["t"] for e in ex],
+                    "debate_extracts": [e["t"] for e in dx]}
+                   for m, ex, dx, _ in batch]
         prompt = (
-            "You are analysing UK MPs' written parliamentary questions for a "
-            "data site. For each MP below, using ONLY their listed questions:\n"
+            "You are analysing UK MPs' parliamentary activity for a data "
+            "site. Each MP below has written_questions and debate_extracts "
+            "(short excerpts of what they said on the floor of the Commons). "
+            "Using ONLY this listed material:\n"
             "1. themes: their top 1-3 subjects (most prominent first). Each "
             'has "subject" (2-5 plain words), "stance" (max 14 words on what '
             "they are doing about it — e.g. 'pressing the government over "
             "delays to compensation payments', 'seeking detail on funding "
             "allocations'; describe conduct, never characterise the person), "
-            'and "eg" (the 0-based index of one listed question that best '
-            "shows the theme).\n"
-            '2. approach: count EVERY listed question into exactly one of: '
+            'and "eg" (the 0-based index into a COMBINED list of '
+            "written_questions followed by debate_extracts, of the one item "
+            "that best shows the theme).\n"
+            '2. approach: count EVERY listed item (questions AND extracts) '
+            'into exactly one of: '
             '"pressing" (demanding action, challenging, chasing failures), '
             '"probing" (seeking information or detail), '
             '"constituency" (local casework framing), '
-            '"supportive" (inviting good news, friendly prompts).\n'
-            "Ground everything in the question texts. Respond with ONLY a "
+            '"supportive" (inviting good news, friendly prompts, defending '
+            "the government's record).\n"
+            "Ground everything in the texts. Debate extracts are fragments — "
+            "judge them cautiously. Respond with ONLY a "
             "JSON array, no markdown fences, of objects "
             '{"id": <id>, "themes": [...], "approach": {...}}.\n\n'
             + json.dumps(payload, ensure_ascii=False)
@@ -499,7 +509,8 @@ def ai_mp_themes(mps_out, mp_q):
         except Exception as e:
             print(f"MP themes: batch failed ({e}) — skipping")
             continue
-        for m, ex, sig in batch:
+        for m, ex, dx, sig in batch:
+            combined = ex + dx
             g = results.get(m["id"])
             if not g or not isinstance(g.get("themes"), list):
                 continue
@@ -511,17 +522,18 @@ def ai_mp_themes(mps_out, mp_q):
                 th = {"subject": str(t["subject"])[:60],
                       "stance": str(t["stance"])[:120]}
                 idx = t.get("eg")
-                if isinstance(idx, int) and 0 <= idx < len(ex):
-                    th["example"] = ex[idx]["t"]
+                if isinstance(idx, int) and 0 <= idx < len(combined):
+                    th["example"] = combined[idx]["t"]
                 themes.append(th)
             if not themes:
                 continue
             approach = {k: int(v) for k, v in (g.get("approach") or {}).items()
                         if k in ("pressing", "probing", "constituency",
                                  "supportive") and isinstance(v, (int, float))}
-            m["themes"], m["approach"], m["themeN"] = themes, approach, len(ex)
+            m["themes"], m["approach"] = themes, approach
+            m["themeN"] = len(combined)
             cache[str(m["id"])] = {"sig": sig, "themes": themes,
-                                   "approach": approach, "n": len(ex),
+                                   "approach": approach, "n": len(combined),
                                    "made": date.today().isoformat()}
             done += 1
     save("mp_glosses.json", cache)
@@ -540,7 +552,15 @@ def _ci(d, *names):
     return None
 
 
-def fetch_debates(state, debates):
+def _snippet(value_html):
+    """Strip a Hansard contribution's HTML down to a short clean extract."""
+    import re
+    txt = re.sub(r"<[^>]+>", " ", str(value_html or ""))
+    txt = html.unescape(re.sub(r"\s+", " ", txt)).strip()
+    return txt[:180] if len(txt) >= 60 else ""
+
+
+def fetch_debates(state, debates, mp_q):
     """Debate sections (Commons Chamber + Westminster Hall) with per-MP
     contribution counts, walked day by day via the Hansard calendar:
     calendar -> sections for day -> section tree -> debate detail.
@@ -612,14 +632,24 @@ def fetch_debates(state, debates):
                 if not dj:
                     continue
                 sp = defaultdict(int)
+                snip = {}
                 for item in (_ci(dj, "Items") or []):
                     if not isinstance(item, dict):
                         continue
                     if str(_ci(item, "ItemType") or "") != "Contribution":
                         continue
                     mid = _ci(item, "MemberId")
-                    if mid:
-                        sp[str(mid)] += 1
+                    if not mid:
+                        continue
+                    sp[str(mid)] += 1
+                    if str(mid) not in snip:
+                        t = _snippet(_ci(item, "Value"))
+                        if t:
+                            snip[str(mid)] = t
+                for mid, t in snip.items():
+                    mq = mp_q.setdefault(mid, {"total": 0, "months": {},
+                                               "bodies": {}})
+                    mq.setdefault("deb_ex", []).append({"d": ds, "t": t})
                 if not sp:
                     continue  # container/heading with no direct speech
                 debates[ext] = {"d": ds, "t": title[:110], "sp": dict(sp)}
@@ -944,7 +974,7 @@ def main():
     fetch_questions(state, q_monthly, mp_q, mode)
 
     debates = load("debates.json", {})
-    fetch_debates(state, debates)
+    fetch_debates(state, debates, mp_q)
     top_headings = sorted(
         {h for m in q_monthly.values() for h in m},
         key=lambda h: -sum(m.get(h, {}).get("n", 0) for m in q_monthly.values()))
@@ -966,6 +996,13 @@ def main():
     theme_floor = (date.today()
                    - timedelta(days=THEME_WINDOW_DAYS + 7)).isoformat()
     for mq in mp_q.values():
+        if "deb_ex" in mq:
+            mq["deb_ex"] = sorted(
+                (e for e in mq["deb_ex"]
+                 if isinstance(e, dict) and e.get("d", "") >= theme_floor),
+                key=lambda e: e["d"])[-12:]
+            if not mq["deb_ex"]:
+                del mq["deb_ex"]
         if "ex" in mq:
             mq["ex"] = sorted(
                 (e for e in mq["ex"]
