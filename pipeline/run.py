@@ -35,6 +35,8 @@ DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 UA = {"User-Agent": "westminster-engine/1.0 (open data project)"}
 
 MEMBERS_URL = "https://members-api.parliament.uk/api/Members/Search"
+BIO_URL = "https://members-api.parliament.uk/api/Members/{}/Biography"
+HANSARD_URL = "https://hansard-api.parliament.uk/search/contributions/Spoken.json"
 DIV_SEARCH = "https://commonsvotes-api.parliament.uk/data/divisions.json/search"
 DIV_ONE = "https://commonsvotes-api.parliament.uk/data/division/{}.json"
 WQ_URL = "https://questions-statements-api.parliament.uk/api/writtenquestions/questions"
@@ -104,6 +106,66 @@ def fetch_members():
             break
     print(f"  {len(members)} current MPs")
     return members
+
+
+def _current_post(posts):
+    """Return the name of the post with no end date, if any."""
+    for p in posts or []:
+        if isinstance(p, dict) and not p.get("endDate"):
+            return (p.get("name") or "").strip()
+    return ""
+
+
+def fetch_roles(members, prev):
+    """Current government/opposition post per MP, from the Members API.
+
+    One call per MP; failures fall back to the previous run's value so a
+    flaky night never blanks the site.
+    """
+    print("Fetching roles…")
+    fails = 0
+    for mid, m in members.items():
+        j = get(BIO_URL.format(mid))
+        if not j:
+            old = prev.get(mid, {})
+            m["role"], m["roleType"] = old.get("role", ""), old.get("roleType", "")
+            fails += 1
+            continue
+        v = j.get("value") or {}
+        gov = _current_post(v.get("governmentPosts"))
+        opp = _current_post(v.get("oppositionPosts"))
+        if gov:
+            m["role"], m["roleType"] = gov, "gov"
+        elif opp:
+            m["role"], m["roleType"] = opp, "opp"
+        else:
+            m["role"], m["roleType"] = "", ""
+    print(f"  roles done ({fails} fallbacks)" if fails else "  roles done")
+
+
+def fetch_spoken(members, prev):
+    """Count of spoken Hansard contributions this parliament, per MP.
+
+    Uses the Hansard search API's result count (take=1 keeps it cheap).
+    Failures fall back to the previous run's value.
+    """
+    print("Fetching spoken contributions…")
+    fails = 0
+    for mid, m in members.items():
+        j = get(HANSARD_URL, {"queryParameters.memberId": mid,
+                              "queryParameters.startDate": START_OF_PARLIAMENT,
+                              "queryParameters.take": 1})
+        n = None
+        if j:
+            for key in ("TotalResultCount", "totalResultCount", "TotalResults"):
+                if isinstance(j.get(key), int):
+                    n = j[key]
+                    break
+        if n is None:
+            n = prev.get(mid, {}).get("spoken", 0)
+            fails += 1
+        m["spoken"] = n
+    print(f"  spoken done ({fails} fallbacks)" if fails else "  spoken done")
 
 
 # ---------------------------------------------------------------- divisions
@@ -238,7 +300,10 @@ def party_majorities(votes, members):
         maj = {}
         for p, (a, n) in tally.items():
             tot = a + n
-            if tot >= 10 and max(a, n) / tot >= 0.6:  # whipped-vote heuristic
+            # 0.85: a genuinely whipped vote moves a party almost as a bloc.
+            # Free/conscience votes (e.g. assisted dying, ~60/40 splits)
+            # fall below this and so produce no "rebels" — by design.
+            if tot >= 10 and max(a, n) / tot >= 0.85:
                 maj[p] = "aye" if a > n else "no"
         out[did] = maj
     return out
@@ -252,7 +317,8 @@ def compute(members, votes, q_monthly, mp_q):
 
     stats = {}
     for mid, m in members.items():
-        stats[mid] = {**m, "voted": 0, "rebellions": 0, "form": []}
+        stats[mid] = {**m, "voted": 0, "rebellions": 0, "form": [],
+                      "reb_votes": []}
 
     for did, d in ordered:
         maj = majors.get(did, {})
@@ -265,6 +331,8 @@ def compute(members, votes, q_monthly, mp_q):
                 rebelled = pm is not None and side != pm
                 if rebelled:
                     s["rebellions"] += 1
+                    s["reb_votes"].append(
+                        {"d": d["date"], "t": d["title"][:90]})
                 if did in recent:
                     s["form"].append("R" if rebelled else "W")
             elif did in recent:
@@ -285,8 +353,11 @@ def compute(members, votes, q_monthly, mp_q):
         mps_out.append({
             "id": int(mid), "name": s["name"], "party": s["party"],
             "seat": s["seat"],
+            "role": s.get("role", ""), "roleType": s.get("roleType", ""),
+            "spoken": s.get("spoken", 0),
             "participation": round(100 * s["voted"] / n_div),
             "rebellions": s["rebellions"],
+            "rebellionVotes": s["reb_votes"][-12:],
             "partyAvgReb": round(party_avg.get(s["party"], 0), 1),
             "form": s["form"][-6:],
             "questions": q["total"],
@@ -352,6 +423,7 @@ def compute(members, votes, q_monthly, mp_q):
                             key=lambda m: -(m["rebellions"] / max(0.5, m["partyAvgReb"]))
                             )[:15] if r["rebellions"] > 0],
         "scrutiny": league(lambda m: m["questions"]),
+        "voice": league(lambda m: m["spoken"]),
         "presence": league(lambda m: m["participation"]),
     }
 
@@ -385,6 +457,11 @@ def main():
     if not members:
         print("FATAL: could not fetch MPs — aborting without touching data.")
         sys.exit(1)
+
+    prev = {str(m.get("id")): m for m in load("mps.json", [])
+            if isinstance(m, dict)}
+    fetch_roles(members, prev)
+    fetch_spoken(members, prev)
 
     fetch_divisions(state, votes)
     fetch_questions(state, q_monthly, mp_q, mode)
