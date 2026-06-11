@@ -22,7 +22,7 @@ no database servers, no running costs.
 
 ## Methodology notes
 A rebellion = voting against the majority of the MP's own party in a division where that
-party voted cohesively (≥60% one way, ≥10 voting). Free votes largely self-exclude by that
-definition. The Speaker, Deputy Speakers and Sinn Féin do not vote; read their rows accordingly.
+party voted as a bloc (≥85% one way, ≥10 voting). Free and conscience votes fall below that
+bar and are excluded by design. The Speaker, Deputy Speakers and Sinn Féin do not vote; read their rows accordingly.
 
 Contains parliamentary information licensed under the Open Parliament Licence v3.0.
