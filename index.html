@@ -247,7 +247,7 @@ function renderMPs(){
       ${(mp.themes||[]).length?`
       <div style="margin-top:18px">
         <div class="label">What they're pursuing · last 6 months
-          <span class="tip faint" title="AI-read nightly from their last ${mp.themeN||"~30"} written questions. Describes what their questions do, not what the MP is like. Hover a theme for an example question. Counts classify each question as: pressing (demanding action), probing (seeking information), constituency (local casework), supportive (friendly prompts).">AI ⓘ</span></div>
+          <span class="tip faint" title="AI-read nightly from their last ${mp.themeN||"~30"} written questions and debate excerpts. Describes what their parliamentary activity does, not what the MP is like. Hover a theme for an example. Counts classify each item as: pressing (demanding action), probing (seeking information), constituency (local casework), supportive (friendly prompts).">AI ⓘ</span></div>
         ${mp.themes.map((t,i)=>`
           <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border)"
                ${t.example?`title="e.g. ${esc(t.example)}"`:""}>
@@ -435,7 +435,7 @@ function renderFoot(){
     contribution counts themselves are pure arithmetic. Every figure is recomputed
     nightly from source and no count or ranking is AI-derived, with two marked exceptions: the italic
     one-line summaries on Momentum, and the "what they're pursuing" panels on MP cards — both
-    AI-written nightly from the MPs' own question texts, flagged ⓘ, and describing parliamentary
+    AI-written nightly from the MPs' own question texts and debate excerpts, flagged ⓘ, and describing parliamentary
     conduct rather than characterising any person.<br><br>
     ${meta.sample ? "Showing sample data — the engine has not yet run." :
       meta.updated ? `Last computed ${esc(meta.updated.slice(0,16).replace("T"," "))} UTC ·
