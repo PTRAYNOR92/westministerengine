@@ -41,7 +41,9 @@ UA = {"User-Agent": "westminster-engine/1.0 (open data project)"}
 MEMBERS_URL = "https://members-api.parliament.uk/api/Members/Search"
 BIO_URL = "https://members-api.parliament.uk/api/Members/{}/Biography"
 HANSARD_URL = "https://hansard-api.parliament.uk/search/contributions/Spoken.json"
-HANSARD_DEB_SEARCH = "https://hansard-api.parliament.uk/search/debates/debatesearch.json"
+HANSARD_CAL = "https://hansard-api.parliament.uk/overview/calendar.json"
+HANSARD_SECTIONS = "https://hansard-api.parliament.uk/overview/sectionsforday.json"
+HANSARD_TREES = "https://hansard-api.parliament.uk/overview/sectiontrees.json"
 HANSARD_DEBATE = "https://hansard-api.parliament.uk/debates/debate/{}.json"
 DEBATE_WINDOW_DAYS = 190  # how far back the debate layer looks/keeps
 DIV_SEARCH = "https://commonsvotes-api.parliament.uk/data/divisions.json/search"
@@ -540,62 +542,94 @@ def _ci(d, *names):
 
 def fetch_debates(state, debates):
     """Debate sections (Commons Chamber + Westminster Hall) with per-MP
-    contribution counts. Covers debates, bill stages, oral questions,
-    urgent questions, statements — anything spoken on the floor.
+    contribution counts, walked day by day via the Hansard calendar:
+    calendar -> sections for day -> section tree -> debate detail.
 
-    Incremental by ext id: already-stored sections are never refetched, so
-    the first run does the ~6-month catch-up and nightly runs only fetch
-    the latest sitting day. Entries older than the window are pruned.
+    Incremental: stored sections are never refetched; nightly runs only
+    walk days since the last seen sitting date. Old entries are pruned.
     """
     frm = state.get("last_debate_date") or \
         (date.today() - timedelta(days=DEBATE_WINDOW_DAYS)).isoformat()
+    today = date.today()
     print(f"Fetching debate sections since {frm}…")
-    skip, found, fetched, latest = 0, 0, 0, frm
-    while True:
-        j = get(HANSARD_DEB_SEARCH, {
-            "queryParameters.startDate": frm,
-            "queryParameters.endDate": date.today().isoformat(),
-            "queryParameters.house": "Commons",
-            "queryParameters.take": 100, "queryParameters.skip": skip})
-        if not j:
-            print(f"  WARNING: debate search died at skip={skip}")
-            break
-        results = _ci(j, "Results") or []
-        if not results:
-            break
-        for r in results:
-            ext = _ci(r, "DebateSectionExtId")
-            title = html.unescape(str(_ci(r, "Title") or "")).strip()[:110]
-            sdate = str(_ci(r, "SittingDate") or "")[:10]
-            found += 1
-            if sdate > latest:
-                latest = sdate
-            if not ext or ext in debates or not title:
-                continue
-            dj = get(HANSARD_DEBATE.format(ext))
-            if not dj:
-                continue
-            sp = defaultdict(int)
-            for item in (_ci(dj, "Items") or []):
-                if not isinstance(item, dict):
+
+    def walk(node, out):
+        """Collect (ExternalId, Title) from any tree shape, recursively."""
+        if isinstance(node, dict):
+            ext = title = None
+            for k, v in node.items():
+                kl = k.lower()
+                if kl == "externalid" and v:
+                    ext = str(v)
+                elif kl == "title" and v:
+                    title = html.unescape(str(v)).strip()
+            if ext and title:
+                out.append((ext, title))
+            for v in node.values():
+                walk(v, out)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, out)
+
+    # sitting dates in range, via monthly calendar
+    cur = datetime.strptime(frm, "%Y-%m-%d").date().replace(day=1)
+    sitting = []
+    while cur <= today:
+        cal = get(HANSARD_CAL, {"year": cur.year, "month": cur.month,
+                                "house": "Commons"})
+        for item in (cal or []):
+            ds = None
+            if isinstance(item, str):
+                ds = item[:10]
+            elif isinstance(item, dict):
+                for k, v in item.items():
+                    if "date" in k.lower() and str(v)[:4].isdigit():
+                        ds = str(v)[:10]
+                        break
+            if ds and frm <= ds <= today.isoformat():
+                sitting.append(ds)
+        cur = date(cur.year + 1, 1, 1) if cur.month == 12 else \
+            date(cur.year, cur.month + 1, 1)
+    sitting = sorted(set(sitting))
+    print(f"  {len(sitting)} sitting days to walk")
+
+    found, fetched, latest = 0, 0, frm
+    for ds in sitting:
+        secs = get(HANSARD_SECTIONS, {"date": ds, "house": "Commons"}) or []
+        for sec in secs:
+            sl = str(sec).lower()
+            if sl != "debate" and "westminster" not in sl:
+                continue  # written statements/answers/petitions etc
+            trees = get(HANSARD_TREES, {"section": sec, "date": ds,
+                                        "house": "Commons"})
+            nodes = []
+            walk(trees, nodes)
+            for ext, title in nodes:
+                found += 1
+                if ext in debates:
                     continue
-                if str(_ci(item, "ItemType") or "") != "Contribution":
+                dj = get(HANSARD_DEBATE.format(ext))
+                if not dj:
                     continue
-                mid = _ci(item, "MemberId")
-                if mid:
-                    sp[str(mid)] += 1
-            if not sp:
-                continue  # container/procedural section with no speech
-            debates[ext] = {"d": sdate, "t": title, "sp": dict(sp)}
-            fetched += 1
-        skip += 100
-        total = _ci(j, "TotalResultCount") or _ci(j, "TotalResults") or 0
-        if skip >= int(total or 0):
-            break
+                sp = defaultdict(int)
+                for item in (_ci(dj, "Items") or []):
+                    if not isinstance(item, dict):
+                        continue
+                    if str(_ci(item, "ItemType") or "") != "Contribution":
+                        continue
+                    mid = _ci(item, "MemberId")
+                    if mid:
+                        sp[str(mid)] += 1
+                if not sp:
+                    continue  # container/heading with no direct speech
+                debates[ext] = {"d": ds, "t": title[:110], "sp": dict(sp)}
+                fetched += 1
+        if ds > latest:
+            latest = ds
     # refetch overlap of a couple of days; prune beyond the window
     state["last_debate_date"] = (
         datetime.strptime(latest, "%Y-%m-%d")
-        - timedelta(days=2)).date().isoformat() if (fetched or found) else frm
+        - timedelta(days=2)).date().isoformat() if sitting else frm
     floor = (date.today() - timedelta(days=DEBATE_WINDOW_DAYS)).isoformat()
     for k in [k for k, e in debates.items() if e.get("d", "") < floor]:
         del debates[k]
