@@ -156,6 +156,8 @@ function renderMomentum(){
         <span class="growth ${x.growth==null?"dim":x.growth>=0?"hot":"cool"}">
           ${x.growth==null?"NEW":(x.growth>=0?"▲ ":"▼ ")+Math.abs(x.growth)+"%"}</span>
       </div>
+      ${x.gloss?`<div style="font-size:13px;color:var(--dim);margin-top:8px;font-style:italic;max-width:720px">${esc(x.gloss)}
+        <span class="tip faint" style="font-style:normal" title="AI-written summary of what the underlying questions are probing, generated nightly from sample question texts. Counts and rankings are never AI-derived.">ⓘ</span></div>`:""}
       <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
         <span class="mono faint" style="font-size:10px;width:64px">PREV QTR</span>
         <div class="bar"><i style="width:${Math.min(100,100*x.prev/Math.max(x.cur,x.prev,1))}%;background:#3A4458"></i></div>
@@ -240,6 +242,23 @@ function renderMPs(){
           </div>`).join("")}
         ${mp.rebellionVotes.length>8?`<div class="faint" style="font-size:11px;margin-top:5px">+ ${mp.rebellions-8} more</div>`:""}
       </div>`:""}
+      ${(mp.themes||[]).length?`
+      <div style="margin-top:18px">
+        <div class="label">What they're pursuing · last 6 months
+          <span class="tip faint" title="AI-read nightly from their last ${mp.themeN||"~30"} written questions. Describes what their questions do, not what the MP is like. Hover a theme for an example question. Counts classify each question as: pressing (demanding action), probing (seeking information), constituency (local casework), supportive (friendly prompts).">AI ⓘ</span></div>
+        ${mp.themes.map((t,i)=>`
+          <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border)"
+               ${t.example?`title="e.g. ${esc(t.example)}"`:""}>
+            <span class="mono faint" style="font-size:11px;flex-shrink:0">0${i+1}</span>
+            <span style="font-size:13px;min-width:0"><b>${esc(t.subject)}</b>
+              <span class="dim">— ${esc(t.stance)}</span></span>
+          </div>`).join("")}
+        ${mp.approach?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">
+          ${[["pressing","Pressing for action","var(--hot)"],["probing","Seeking information","var(--violet)"],["constituency","Constituency","var(--cool)"],["supportive","Supportive","var(--warm)"]]
+            .filter(([k])=>mp.approach[k]>0)
+            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.approach[k]}</span>`).join("")}
+        </div>`:""}
+      </div>`:""}
       <div style="margin-top:18px">
         <div class="label">Question subjects · share of output
           <span class="tip faint" title="Which government departments their written questions are addressed to">ⓘ</span></div>
@@ -297,8 +316,11 @@ function renderFoot(){
     is listed on the MP's card so you can judge it yourself. Spoken contributions count speeches,
     interventions and oral answers in Hansard. Participation counts tellers as not voting, and the
     Speaker, Deputy Speakers and Sinn Féin do not vote by role or choice; their figures should be read
-    accordingly. Question subjects reflect the answering department. Nothing on this site is an opinion:
-    every figure is recomputed nightly from source.<br><br>
+    accordingly. Question subjects reflect the answering department. Every figure is recomputed
+    nightly from source and no count or ranking is AI-derived, with two marked exceptions: the italic
+    one-line summaries on Momentum, and the "what they're pursuing" panels on MP cards — both
+    AI-written nightly from the MPs' own question texts, flagged ⓘ, and describing parliamentary
+    conduct rather than characterising any person.<br><br>
     ${meta.sample ? "Showing sample data — the engine has not yet run." :
       meta.updated ? `Last computed ${esc(meta.updated.slice(0,16).replace("T"," "))} UTC ·
       ${meta.divisions||0} divisions · ${(meta.questions||0).toLocaleString()} questions ·
