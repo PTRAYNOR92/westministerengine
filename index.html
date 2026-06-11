@@ -143,8 +143,8 @@ function renderMomentum(){
   if(!t?.length) return `<div class="empty">No topic data yet — run the backfill on GitHub.</div>`;
   return `<div class="grid" style="gap:12px">
     <p class="dim" style="font-size:12.5px;max-width:760px">
-      Question subjects ranked by <span class="tip" title="Questions in the last ~90 days versus the previous ~90 days">quarter-on-quarter acceleration</span>,
-      not raw volume — "housing is big" is wallpaper; "this subject doubled in a quarter" is intelligence.</p>
+      Ranked by <span class="tip" title="Questions in the last ~90 days versus the previous ~90 days">growth, not size</span>.
+      The biggest subjects are always big — this page shows what's suddenly getting attention instead.</p>
     ${t.map((x,i)=>`
     <div class="panel">
       <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px">
@@ -210,22 +210,36 @@ function renderMPs(){
             <span style="font:700 24px var(--disp)">${esc(mp.name)}</span>${pdot(mp.party)}
           </div>
           <div class="dim" style="font-size:12.5px;margin-top:4px">${esc(mp.seat)}</div>
+          <div style="font:600 10.5px var(--mono);letter-spacing:1.5px;text-transform:uppercase;margin-top:6px;color:${mp.role?"var(--violet)":"var(--faint)"}">
+            ${esc(mp.role || "Backbencher")}</div>
         </div>
         <div style="text-align:right">
           <div class="label" style="margin-bottom:6px">Last six divisions</div>
           ${chips || '<span class="faint" style="font-size:11px">no votes recorded</span>'}
         </div>
       </div>
-      <div class="grid g3" style="margin-top:18px">
+      <div class="grid" style="margin-top:18px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
         <div class="stat"><div class="n ${mp.rebellions>0&&ratio>=2?"hot":""}">${mp.rebellions}</div>
-          <div class="l"><span class="tip" title="Votes cast against the majority of their own party, in divisions where that party voted cohesively (≥60% one way, ≥10 voting)">REBELLIONS</span> · ${ratio}× PARTY AVG</div></div>
+          <div class="l"><span class="tip" title="Votes cast against the majority of their own party, in divisions where that party voted as a bloc (≥85% one way, ≥10 voting). Free and conscience votes fall below this bar and are excluded by design">REBELLIONS</span> · ${ratio}× PARTY AVG</div></div>
         <div class="stat"><div class="n">${mp.participation}%</div>
           <div class="l"><span class="tip" title="Share of all Commons divisions this parliament in which they cast a vote">DIVISION PARTICIPATION</span></div></div>
+        <div class="stat"><div class="n">${(mp.spoken||0).toLocaleString()}</div>
+          <div class="l"><span class="tip" title="Spoken contributions recorded in Hansard this parliament — speeches, interventions and oral answers">SPOKEN CONTRIBUTIONS</span></div></div>
         <div class="stat"><div class="n">${mp.questions}</div>
-          <div class="l"><span class="tip" title="Written parliamentary questions tabled this parliament">WRITTEN QUESTIONS</span>
-          <span style="float:right">${spark(mp.spark, "url(#g)") ? "" : ""}</span></div>
+          <div class="l"><span class="tip" title="Written parliamentary questions tabled this parliament">WRITTEN QUESTIONS</span></div>
           <div style="margin-top:6px">${spark(mp.spark, c)}</div></div>
       </div>
+      ${(mp.rebellionVotes||[]).length ? `
+      <div style="margin-top:18px">
+        <div class="label">Where they broke with party
+          <span class="tip faint" title="The exact divisions counted as rebellions — so you can judge them yourself">ⓘ</span></div>
+        ${mp.rebellionVotes.slice(-8).reverse().map(r=>`
+          <div style="display:flex;gap:10px;align-items:baseline;padding:5px 0;border-top:1px solid var(--border);font-size:12px">
+            <span class="mono faint" style="flex-shrink:0">${esc(r.d)}</span>
+            <span class="dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.t)}</span>
+          </div>`).join("")}
+        ${mp.rebellionVotes.length>8?`<div class="faint" style="font-size:11px;margin-top:5px">+ ${mp.rebellions-8} more</div>`:""}
+      </div>`:""}
       <div style="margin-top:18px">
         <div class="label">Question subjects · share of output
           <span class="tip faint" title="Which government departments their written questions are addressed to">ⓘ</span></div>
@@ -234,7 +248,7 @@ function renderMPs(){
             <span style="font-size:12px;width:230px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t)}</span>
             <div class="bar"><i style="width:${v}%;background:${c}"></i></div>
             <span class="mono dim" style="font-size:11px;width:34px;text-align:right">${v}%</span>
-          </div>`).join("") || '<span class="faint" style="font-size:12px">No questions tabled yet.</span>'}
+          </div>`).join("") || `<span class="faint" style="font-size:12px">${mp.roleType==="gov" ? "None — ministers answer written questions rather than table them." : "No questions tabled yet."}</span>`}
       </div>
       <p class="faint" style="font-size:11px;margin-top:16px">
         Phase one: pure counts from the official record. Tone, friendly fire, silence signals
@@ -258,9 +272,10 @@ function renderLeagues(){
           <span class="mono" style="font-weight:600">${fmt(r)}</span>
         </div>`).join("") || '<div class="faint" style="font-size:12px">Awaiting data.</div>'}
     </div>`;
-  return `<div class="grid g3">
+  return `<div class="grid g2">
     ${block("Independence index","Rebellions relative to their own party's average — measured this way because four rebellions in a tightly-whipped party mean far more than four in a loose one", L.independence, r=>r.v+"× <span class='faint'>("+r.raw+")</span>")}
-    ${block("Scrutiny volume","Written questions tabled this parliament", L.scrutiny, r=>r.v)}
+    ${block("Chamber voice","Spoken contributions recorded in Hansard this parliament — speeches, interventions and oral answers", L.voice, r=>(r.v||0).toLocaleString())}
+    ${block("Scrutiny volume","Written questions tabled this parliament. Ministers answer questions rather than table them, so frontbenchers rank low by design", L.scrutiny, r=>r.v)}
     ${block("Division presence","Share of all divisions voted in", L.presence, r=>r.v+"%")}
   </div>`;
 }
@@ -275,10 +290,12 @@ function renderFoot(){
   const meta = DATA.meta || {};
   document.getElementById("foot").innerHTML = `
     <strong style="color:var(--dim)">Methodology.</strong>
-    All data derives from the official record via the UK Parliament Members, Commons Votes and
-    Written Questions APIs. A "rebellion" means voting against the majority of the MP's own party
-    in a division where that party voted cohesively (at least 60% one way, at least 10 members voting) —
-    free votes therefore largely self-exclude. Participation counts tellers as not voting, and the
+    All data derives from the official record via the UK Parliament Members, Commons Votes,
+    Written Questions and Hansard APIs. A "rebellion" means voting against the majority of the MP's own party
+    in a division where that party voted as a bloc (at least 85% one way, at least 10 members voting) —
+    free and conscience votes fall below that bar and are excluded by design; every counted rebellion
+    is listed on the MP's card so you can judge it yourself. Spoken contributions count speeches,
+    interventions and oral answers in Hansard. Participation counts tellers as not voting, and the
     Speaker, Deputy Speakers and Sinn Féin do not vote by role or choice; their figures should be read
     accordingly. Question subjects reflect the answering department. Nothing on this site is an opinion:
     every figure is recomputed nightly from source.<br><br>
