@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Westminster Engine — performance data for Parliament</title>
+<title>The Commons Index — what is Parliament talking about?</title>
 <meta name="description" content="Every question counted, every division tracked, every MP profiled. Computed nightly from the official parliamentary record.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -85,10 +85,11 @@ spark{display:inline-block}
   <header>
     <div class="head">
       <div>
-        <div class="eyebrow">WESTMINSTER ENGINE · PHASE ONE</div>
-        <h1>Westminster, decoded.</h1>
-        <p class="sub">Every question counted, every division tracked, all 650 MPs profiled.
-        Computed nightly from the official parliamentary record — opinion-free.</p>
+        <div class="eyebrow">THE COMMONS INDEX</div>
+        <h1>The Commons Index</h1>
+        <p class="sub">What is Parliament talking about? We identify trends and momentum
+        through data — every question counted, every division tracked, computed nightly
+        from the official record.</p>
       </div>
       <nav id="nav"></nav>
     </div>
@@ -105,9 +106,9 @@ const pcol = p => PARTY[p] || "#8A94A8";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-let DATA = {}, tab = "momentum", selMP = null, query = "";
+let DATA = {}, tab = "momentum", selMP = null, query = "", selDept = "";
 
-const TABS = [["momentum","Momentum"],["mps","MP intelligence"],["leagues","League tables"]];
+const TABS = [["momentum","Momentum"],["mps","MP intelligence"],["leagues","League tables"],["about","About"]];
 
 async function boot(){
   const files = ["meta","mps","topics","leagues"];
@@ -296,13 +297,103 @@ function renderLeagues(){
     ${block("Chamber voice","Spoken contributions recorded in Hansard this parliament — speeches, interventions and oral answers", L.voice, r=>(r.v||0).toLocaleString())}
     ${block("Scrutiny volume","Written questions tabled this parliament. Ministers answer questions rather than table them, so frontbenchers rank low by design", L.scrutiny, r=>r.v)}
     ${block("Division presence","Share of all divisions voted in", L.presence, r=>r.v+"%")}
+  </div>
+  ${L.policy ? `
+  <div class="panel" style="margin-top:14px">
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:10px">
+      <div class="label">By policy area
+        <span class="tip faint" title="Top askers of written questions per answering department, this parliament. Pure counts — no AI involved.">ⓘ</span></div>
+      <select id="dept-pick" onchange="selDept=this.value;render()"
+        style="background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:8px;padding:7px 10px;color:var(--fg);font:600 12px var(--disp);max-width:100%">
+        ${Object.keys(L.policy).map(d=>`<option value="${esc(d)}" ${d===selDept?"selected":""}>${esc(d)}</option>`).join("")}
+      </select>
+    </div>
+    ${(()=>{const d=L.policy[selDept]||L.policy[Object.keys(L.policy)[0]];if(!d)return"";
+      return `<div class="faint" style="font-size:11px;margin:8px 0 4px">${d.total.toLocaleString()} questions to this department in total</div>`+
+      d.top.map((r,i)=>`
+      <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border)">
+        <span class="mono faint" style="font-size:11px;width:20px">${String(i+1).padStart(2,"0")}</span>
+        ${pdot(r.party)}
+        <span style="font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.name)}
+          <span class="faint" style="font-size:11px">· ${esc(r.seat)}</span></span>
+        <span class="mono" style="font-size:12px;margin-left:auto">${r.n}</span>
+      </div>`).join("");})()}
+  </div>`:""}`;
+}
+
+// Contact form: replace YOUR_FORM_ID below with your Formspree form ID
+// (sign up free at formspree.io — messages forward to your email, which
+// never appears anywhere on this site or in this code).
+const FORM_ENDPOINT = "https://formspree.io/f/YOUR_FORM_ID";
+
+function renderAbout(){
+  const configured = !FORM_ENDPOINT.includes("YOUR_FORM_ID");
+  return `<div class="panel" style="max-width:760px">
+    <h2 style="font:700 22px var(--disp);margin:0 0 14px">About The Commons Index</h2>
+    <div style="font-size:14px;line-height:1.7;color:var(--dim)">
+      <p>I built this as a quick project to see whether AI and data could pick out
+      trends and momentum in what Parliament is actually talking about. In particular,
+      which subjects are rising, which MPs are pursuing what, and how the conversation
+      moves week to week.</p>
+      <p>Everything starts from the official Hansard record: every written question,
+      every division, every debate counted nightly. The counts and rankings are pure
+      arithmetic. The short written summaries are AI-generated from the underlying
+      question texts and are marked ⓘ wherever they appear.</p>
+      <p><strong style="color:var(--fg)">A note of caution.</strong> Classifying tone
+      and intent in parliamentary language is inherently hard (even for an AI tool!) —
+      for example, a question can be read as a friendly prompt or a loaded challenge.
+      Using AI we classify every data point and the broad trends hold up well, but any
+      individual classification can misfire, so read the AI-derived elements with
+      appropriate caution and check the underlying questions, which are always shown.</p>
+      <h3 style="font:600 17px var(--disp);color:var(--fg);margin:20px 0 8px">About me</h3>
+      <p>I'm Patrick, and have been working in public affairs for over a decade. I have
+      built this as an independent project — it has no connection to Parliament. I'd
+      genuinely love to know what you think: impressions, corrections, ideas. Corrections
+      are always welcome and acted on.</p>
+    </div>
+    <div style="margin-top:22px;border-top:1px solid var(--border);padding-top:18px">
+      <div class="label" style="margin-bottom:10px">Get in touch</div>
+      ${configured ? `
+      <div id="form-wrap">
+        <div style="display:flex;flex-direction:column;gap:10px;max-width:480px">
+          <input id="cf-email" type="email" placeholder="Your email (optional)"
+            style="background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--fg);font:400 13px var(--disp)">
+          <textarea id="cf-msg" rows="4" placeholder="Your message…"
+            style="background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--fg);font:400 13px var(--disp);resize:vertical"></textarea>
+          <button onclick="sendContact()" style="font:600 13px var(--disp);padding:10px 22px;border-radius:99px;border:none;background:var(--grad);color:var(--bg);cursor:pointer;align-self:flex-start">Send</button>
+          <div id="cf-status" class="faint" style="font-size:12px"></div>
+        </div>
+      </div>` : `
+      <div class="faint" style="font-size:13px">Contact form coming shortly.</div>`}
+    </div>
+    <div class="faint" style="font-size:11px;margin-top:22px;border-top:1px solid var(--border);padding-top:14px">
+      Contains parliamentary information licensed under the Open Parliament Licence v3.0.
+      All other content and code © Patrick, all rights reserved.
+    </div>
   </div>`;
+}
+
+async function sendContact(){
+  const msg = document.getElementById("cf-msg").value.trim();
+  const email = document.getElementById("cf-email").value.trim();
+  const status = document.getElementById("cf-status");
+  if(!msg){ status.textContent = "Write a message first."; return; }
+  status.textContent = "Sending…";
+  try{
+    const r = await fetch(FORM_ENDPOINT, {method:"POST",
+      headers:{"Content-Type":"application/json","Accept":"application/json"},
+      body: JSON.stringify({email, message: msg})});
+    if(r.ok){ status.textContent = "Sent — thank you!";
+      document.getElementById("cf-msg").value = ""; }
+    else status.textContent = "Something went wrong — please try again later.";
+  }catch(e){ status.textContent = "Something went wrong — please try again later."; }
 }
 
 function render(keepFocus){
   const m = document.getElementById("main");
   m.innerHTML = tab==="momentum" ? renderMomentum()
-              : tab==="mps" ? renderMPs() : renderLeagues();
+              : tab==="mps" ? renderMPs()
+              : tab==="about" ? renderAbout() : renderLeagues();
   if(keepFocus){ const s=m.querySelector(".search"); if(s){s.focus();s.setSelectionRange(s.value.length,s.value.length);} }
 }
 function renderFoot(){
@@ -326,7 +417,8 @@ function renderFoot(){
       ${meta.divisions||0} divisions · ${(meta.questions||0).toLocaleString()} questions ·
       ${meta.mps||0} MPs` : "Awaiting first run."}
     · Contains parliamentary information licensed under the
-    <a href="https://www.parliament.uk/site-information/copyright-parliament/open-parliament-licence/">Open Parliament Licence v3.0</a>.`;
+    <a href="https://www.parliament.uk/site-information/copyright-parliament/open-parliament-licence/">Open Parliament Licence v3.0</a>
+    · Built by Patrick, a public affairs professional — see the About tab to get in touch. Corrections welcome.`;
 }
 boot();
 </script>
