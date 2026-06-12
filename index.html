@@ -154,7 +154,7 @@ function renderMomentum(){
           <span style="font:700 17px var(--disp)">${esc(x.topic)}</span>
           <span class="faint" style="font-size:11px">→ ${esc(x.body)}</span>
         </div>
-        <span class="growth ${x.growth==null?"dim":x.growth>=0?"hot":"cool"}">
+        <span class="growth ${x.growth==null?"dim":x.growth>=0?"cool":"hot"}">
           ${x.growth==null?"NEW":(x.growth>=0?"▲ ":"▼ ")+Math.abs(x.growth)+"%"}</span>
       </div>
       ${x.qcur!=null?`<div class="faint" style="font:500 11px var(--mono);margin-top:6px">${x.qcur} written questions · ${x.dcur||0} debate contributions</div>`:""}
