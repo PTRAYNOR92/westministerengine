@@ -680,7 +680,9 @@ def ai_tag_debates(debates, headings, depts):
     if not key:
         print(f"Debate tags: no key — {len(todo)} sections untagged")
         return
-    todo = todo[:900]
+    todo = sorted(todo, key=lambda kv: kv[1].get("d", ""),
+                  reverse=True)[:900]  # newest first: current quarter
+                                       # must never be the untagged part
     print(f"Debate tags: tagging {len(todo)} sections…")
     done = 0
     for i in range(0, len(todo), 40):
