@@ -90,6 +90,9 @@ spark{display:inline-block}
         <p class="sub">What is Parliament talking about? We identify trends and momentum
         through data — every question counted, every division tracked, computed nightly
         from the official record.</p>
+        <a href="https://www.linkedin.com/newsletters/the-commons-index-7472042334084579328/"
+           target="_blank" rel="noopener"
+           style="display:inline-block;margin-top:8px;font:600 11px var(--mono);letter-spacing:1px;text-transform:uppercase;color:var(--cool);text-decoration:none;border:1px solid color-mix(in srgb,var(--cool) 35%,transparent);border-radius:99px;padding:5px 12px;background:color-mix(in srgb,var(--cool) 8%,transparent)">Read the newsletter →</a>
       </div>
       <nav id="nav"></nav>
     </div>
@@ -260,6 +263,29 @@ function renderMPs(){
             .filter(([k])=>mp.approach[k]>0)
             .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.approach[k]}</span>`).join("")}
         </div>`:""}
+      </div>`:""}
+      ${mp.said?`
+      <div style="margin-top:18px">
+        <div class="label">How they're speaking · last 6 months
+          <span class="tip faint" title="AI-read nightly from their full debate contributions, each judged in the context of its whole exchange. Stance is measured against the government position, never the previous speaker: supporting, pushing further (backs the direction but demands more), opposing, seeking (genuinely asking), constituency (local case). Tone is judged independently — measured is the default and heat must be earned. Every line carries a verbatim quote; hover to see it.">AI ⓘ</span></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+          ${[["supporting","Supporting","var(--warm)"],["pushing further","Pushing further","var(--violet)"],["opposing","Opposing","var(--hot)"],["seeking","Seeking","var(--cool)"],["constituency","Constituency","var(--dim)"]]
+            .filter(([k])=>mp.said.stance[k]>0)
+            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.said.stance[k]}</span>`).join("")}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+          ${[["heated","Heated","var(--hot)"],["impassioned","Impassioned","var(--violet)"],["concerned","Concerned","var(--warm)"],["measured","Measured","var(--dim)"],["warm","Warm","var(--cool)"]]
+            .filter(([k])=>mp.said.tone[k]>0)
+            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.said.tone[k]}</span>`).join("")}
+        </div>
+        ${(mp.said.recent||[]).map(r=>`
+          <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border);font-size:12.5px"
+               title="&ldquo;${esc(r.q)}&rdquo;">
+            <span class="mono faint" style="flex-shrink:0">${esc(r.d)}</span>
+            <span style="min-width:0"><b>${esc(r.issue)}</b>
+              <span class="mono faint" style="font-size:10px"> ${esc(r.stance)} · ${esc(r.tone)}</span>
+              <span class="dim">— ${esc(r.sum)}</span></span>
+          </div>`).join("")}
       </div>`:""}
       ${(mp.speaking||[]).length?`
       <div style="margin-top:18px">
@@ -443,7 +469,8 @@ function renderFoot(){
       ${meta.mps||0} MPs` : "Awaiting first run."}
     · Contains parliamentary information licensed under the
     <a href="https://www.parliament.uk/site-information/copyright-parliament/open-parliament-licence/">Open Parliament Licence v3.0</a>
-    · Built by Patrick, a public affairs professional — see the About tab to get in touch. Corrections welcome.`;
+    · Built by Patrick, a public affairs professional — see the About tab to get in touch. Corrections welcome.
+    · <a href="https://www.linkedin.com/newsletters/the-commons-index-7472042334084579328/" target="_blank" rel="noopener">The Commons Index newsletter on LinkedIn</a>.`;
 }
 boot();
 </script>
