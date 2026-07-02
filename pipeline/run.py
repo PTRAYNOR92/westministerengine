@@ -46,6 +46,17 @@ HANSARD_SECTIONS = "https://hansard-api.parliament.uk/overview/sectionsforday.js
 HANSARD_TREES = "https://hansard-api.parliament.uk/overview/sectiontrees.json"
 HANSARD_DEBATE = "https://hansard-api.parliament.uk/debates/debate/{}.json"
 DEBATE_WINDOW_DAYS = 190  # how far back the debate layer looks/keeps
+
+# --- full-speech classification (issue / stance / tone / summary) ---
+CLASS_STANCES = ("supporting", "pushing further", "opposing",
+                 "seeking", "constituency")
+CLASS_TONES = ("heated", "impassioned", "concerned", "measured", "warm")
+CLASS_MAX_CHARS = 6000       # reading limit per contribution (very long speeches)
+CLASS_CHUNK = 25             # contributions per API call
+CLASS_CHUNK_CAP = 300        # max chunks classified per night (cost guard)
+CLASS_PENDING_MAX_DAYS = 14  # unclassified material older than this degrades
+                             # to a plain snippet so nothing is ever lost
+CLASS_KEEP = 50              # classified extracts kept per MP (was 12 snippets)
 DIV_SEARCH = "https://commonsvotes-api.parliament.uk/data/divisions.json/search"
 DIV_ONE = "https://commonsvotes-api.parliament.uk/data/division/{}.json"
 WQ_URL = "https://questions-statements-api.parliament.uk/api/writtenquestions/questions"
@@ -560,10 +571,24 @@ def _snippet(value_html):
     return txt[:180] if len(txt) >= 60 else ""
 
 
-def fetch_debates(state, debates, mp_q):
+def _fulltext(value_html):
+    """Full cleaned text of a Hansard contribution, for AI classification.
+    Same cleaning as _snippet but keeps the whole speech (capped only at
+    CLASS_MAX_CHARS so a single marathon speech can't blow a call)."""
+    import re
+    txt = re.sub(r"<[^>]+>", " ", str(value_html or ""))
+    txt = html.unescape(re.sub(r"\s+", " ", txt)).strip()
+    return txt[:CLASS_MAX_CHARS] if len(txt) >= 60 else ""
+
+
+def fetch_debates(state, debates, mp_q, pending):
     """Debate sections (Commons Chamber + Westminster Hall) with per-MP
     contribution counts, walked day by day via the Hansard calendar:
     calendar -> sections for day -> section tree -> debate detail.
+
+    Full contribution texts are queued (in spoken order, whole exchange
+    per section) into `pending` for AI classification — see
+    ai_classify_debates. Nothing shortened at capture time any more.
 
     Incremental: stored sections are never refetched; nightly runs only
     walk days since the last seen sitting date. Old entries are pruned.
@@ -632,7 +657,7 @@ def fetch_debates(state, debates, mp_q):
                 if not dj:
                     continue
                 sp = defaultdict(int)
-                snip = {}
+                items = []
                 for item in (_ci(dj, "Items") or []):
                     if not isinstance(item, dict):
                         continue
@@ -642,14 +667,12 @@ def fetch_debates(state, debates, mp_q):
                     if not mid:
                         continue
                     sp[str(mid)] += 1
-                    if str(mid) not in snip:
-                        t = _snippet(_ci(item, "Value"))
-                        if t:
-                            snip[str(mid)] = t
-                for mid, t in snip.items():
-                    mq = mp_q.setdefault(mid, {"total": 0, "months": {},
-                                               "bodies": {}})
-                    mq.setdefault("deb_ex", []).append({"d": ds, "t": t})
+                    txt = _fulltext(_ci(item, "Value"))
+                    if txt:
+                        items.append({"mid": str(mid), "txt": txt})
+                if items:
+                    pending.append({"ext": ext, "d": ds,
+                                    "title": title[:110], "items": items})
                 if not sp:
                     continue  # container/heading with no direct speech
                 debates[ext] = {"d": ds, "t": title[:110], "sp": dict(sp)}
@@ -736,6 +759,173 @@ def ai_tag_debates(debates, headings, depts):
 
 
 # ---------------------------------------------------------------- compute
+# ------------------------------------------------- speech classification
+def ai_classify_debates(pending, mp_q, members):
+    """Read every new contribution IN FULL, in the context of its whole
+    debate, and store a small verdict on the speaking MP: issue, stance,
+    tone, a one/two-sentence summary, and a verbatim receipt quote.
+    The AI reads everything; only the verdict is stored.
+
+    stance (anchored to the GOVERNMENT position, never to the previous
+    speaker): supporting / pushing further / opposing / seeking /
+    constituency.
+    tone (judged independently of stance; measured is the default and
+    heat must be earned): heated / impassioned / concerned / measured /
+    warm.
+
+    Each contribution is read exactly once, the night it is new.
+    Unclassified material persists in data/pending_class.json and is
+    retried on later nights; anything older than CLASS_PENDING_MAX_DAYS
+    degrades to a plain snippet so no contribution is ever lost."""
+    if not pending:
+        print("Classify: nothing pending")
+        return
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        print(f"Classify: no key — {len(pending)} debates pending")
+        _age_out_pending(pending, mp_q)
+        return
+
+    def who(mid):
+        m = members.get(str(mid)) or {}
+        n, p = m.get("name"), m.get("party")
+        return f"{n} ({p})" if n else f"Member {mid}"
+
+    # oldest first, chunked with 2 contributions of carried context
+    pending.sort(key=lambda d: d.get("d", ""))
+    chunks = []
+    for deb in pending:
+        its = deb["items"]
+        step = CLASS_CHUNK
+        for s in range(0, len(its), step):
+            ctx = max(0, s - 2)
+            chunks.append((deb, ctx, s, min(len(its), s + step)))
+    chunks = chunks[:CLASS_CHUNK_CAP]
+    print(f"Classify: {len(pending)} debates pending, "
+          f"running {len(chunks)} chunk(s)…")
+
+    rules = (
+        "You are classifying UK House of Commons contributions for a "
+        "parliamentary data site. Below is one debate (title, date) and "
+        "its contributions in spoken order. Classify EVERY contribution "
+        'whose "classify" field is true; the rest are context only.\n'
+        "Rules:\n"
+        '- stance: exactly one of "supporting", "pushing further", '
+        '"opposing", "seeking", "constituency". Stance is ALWAYS judged '
+        "against the UK government's position on the matter, never "
+        'against the previous speaker. "I support the hon Gentleman" '
+        'endorsing a critic of the government is "pushing further" or '
+        '"opposing", not "supporting". Use the surrounding contributions '
+        "to resolve who and what is being referred to; never label from "
+        "agreement words alone. Ministers and frontbenchers answering "
+        'for the government are "supporting" unless the text clearly '
+        'shows otherwise. "seeking" means genuinely asking or probing '
+        'without taking a side. "constituency" means raising a local '
+        "case rather than a national position.\n"
+        '- tone: exactly one of "heated", "impassioned", "concerned", '
+        '"measured", "warm". Judge tone INDEPENDENTLY of stance. '
+        '"measured" is the default: Commons language is theatrical by '
+        'convention, so reserve "heated" for genuine hostility or '
+        'indignation and "impassioned" for real intensity without '
+        'hostility. Calm settled opposition is "opposing" + "measured".\n'
+        "- issue: the subject in 1-3 plain words (e.g. 'Gaza', "
+        "'rail fares', 'school funding').\n"
+        "- sum: one or two short plain-English sentences on what the "
+        "speaker is doing (e.g. 'Welcomes the sanctions but says they "
+        "fall short and calls for a full arms embargo.').\n"
+        "- q: a quote of AT MOST 25 words copied VERBATIM from that "
+        "contribution's text, the words that best justify the stance "
+        "and tone together.\n"
+        "Respond with ONLY a JSON array, no markdown fences, of "
+        '{"i": <index>, "issue": "...", "stance": "...", "tone": "...", '
+        '"sum": "...", "q": "..."}.\n\n')
+
+    done_ids, classified = set(), 0
+    for deb, ctx, s, e in chunks:
+        its = deb["items"]
+        contribs = [{"i": j, "who": who(its[j]["mid"]),
+                     "classify": j >= s, "text": its[j]["txt"]}
+                    for j in range(ctx, e)]
+        payload = {"debate": deb["title"], "date": deb["d"],
+                   "contributions": contribs}
+        try:
+            r = requests.post(ANTHROPIC_URL, timeout=240, headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }, json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 8000,
+                "messages": [{"role": "user", "content":
+                              rules + json.dumps(payload,
+                                                 ensure_ascii=False)}],
+            })
+            if r.status_code != 200:
+                print(f"Classify: HTTP {r.status_code} — chunk skipped")
+                continue
+            text = "".join(b.get("text", "")
+                           for b in r.json().get("content", [])
+                           if b.get("type") == "text")
+            text = text.strip().removeprefix("```json") \
+                       .removeprefix("```").removesuffix("```").strip()
+            results = {int(g["i"]): g for g in json.loads(text)
+                       if isinstance(g, dict) and g.get("i") is not None}
+        except Exception as exc:
+            print(f"Classify: chunk failed ({exc}) — will retry")
+            continue
+        for j in range(s, e):
+            g = results.get(j)
+            it = its[j]
+            if not g:
+                continue
+            stance = str(g.get("stance", "")).strip().lower()
+            tone = str(g.get("tone", "")).strip().lower()
+            if stance not in CLASS_STANCES or tone not in CLASS_TONES:
+                continue  # off-menu → stays pending, retried or aged out
+            q = str(g.get("q", "")).strip()
+            if not q or q not in it["txt"] or len(q.split()) > 30:
+                q = it["txt"][:180]  # receipt must be verbatim, else fall back
+            mq = mp_q.setdefault(it["mid"], {"total": 0, "months": {},
+                                             "bodies": {}})
+            mq.setdefault("deb_ex", []).append({
+                "d": deb["d"], "t": q,
+                "issue": str(g.get("issue", ""))[:40],
+                "stance": stance, "tone": tone,
+                "sum": str(g.get("sum", ""))[:240]})
+            it["done"] = True
+            classified += 1
+        if all(i.get("done") for i in its):
+            done_ids.add(deb["ext"])
+    # keep only debates with unclassified items; drop finished ones,
+    # and inside partially-done debates keep everything (context matters)
+    pending[:] = [d for d in pending if d["ext"] not in done_ids]
+    _age_out_pending(pending, mp_q)
+    print(f"Classify: {classified} contributions classified, "
+          f"{len(pending)} debates still pending")
+
+
+def _age_out_pending(pending, mp_q):
+    """Anything unclassified after CLASS_PENDING_MAX_DAYS falls back to
+    the old one-snippet-per-MP behaviour so no speech is ever lost."""
+    floor = (date.today()
+             - timedelta(days=CLASS_PENDING_MAX_DAYS)).isoformat()
+    stale = [d for d in pending if d.get("d", "") < floor]
+    if not stale:
+        return
+    for deb in stale:
+        seen = set()
+        for it in deb["items"]:
+            if it.get("done") or it["mid"] in seen:
+                continue
+            seen.add(it["mid"])
+            mq = mp_q.setdefault(it["mid"], {"total": 0, "months": {},
+                                             "bodies": {}})
+            mq.setdefault("deb_ex", []).append({"d": deb["d"],
+                                                "t": it["txt"][:180]})
+    pending[:] = [d for d in pending if d.get("d", "") >= floor]
+    print(f"Classify: {len(stale)} stale debate(s) aged out to snippets")
+
+
 def party_majorities(votes, members):
     """For each division, which side did each party's majority take?"""
     out = {}
@@ -958,9 +1148,10 @@ def main():
     votes = load("votes.json", {})
     q_monthly = load("q_monthly.json", {})
     mp_q = load("mp_q.json", {})
+    pending = load("pending_class.json", [])
 
     if mode == "backfill":
-        state, votes, q_monthly, mp_q = {}, {}, {}, {}
+        state, votes, q_monthly, mp_q, pending = {}, {}, {}, {}, []
 
     members = fetch_members()
     if not members:
@@ -976,7 +1167,7 @@ def main():
     fetch_questions(state, q_monthly, mp_q, mode)
 
     debates = load("debates.json", {})
-    fetch_debates(state, debates, mp_q)
+    fetch_debates(state, debates, mp_q, pending)
     top_headings = sorted(
         {h for m in q_monthly.values() for h in m},
         key=lambda h: -sum(m.get(h, {}).get("n", 0) for m in q_monthly.values()))
@@ -986,6 +1177,9 @@ def main():
                            for mq in mp_q.values()))[:16]
     ai_tag_debates(debates, top_headings, top_depts_for_ai)
     save("debates.json", debates)
+
+    ai_classify_debates(pending, mp_q, members)
+    save("pending_class.json", pending)
 
     # drop AI-gloss sample texts from months too old to trend
     keep = {(date.today() - timedelta(days=i * 30)).isoformat()[:7]
@@ -1002,7 +1196,7 @@ def main():
             mq["deb_ex"] = sorted(
                 (e for e in mq["deb_ex"]
                  if isinstance(e, dict) and e.get("d", "") >= theme_floor),
-                key=lambda e: e["d"])[-12:]
+                key=lambda e: e["d"])[-CLASS_KEEP:]
             if not mq["deb_ex"]:
                 del mq["deb_ex"]
         if "ex" in mq:
