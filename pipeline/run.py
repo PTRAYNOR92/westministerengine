@@ -891,7 +891,8 @@ def ai_classify_debates(pending, mp_q, members):
                 "d": deb["d"], "t": q,
                 "issue": str(g.get("issue", ""))[:40],
                 "stance": stance, "tone": tone,
-                "sum": str(g.get("sum", ""))[:240]})
+                "sum": str(g.get("sum", ""))[:240],
+                "ext": deb["ext"], "dt": deb["title"]})
             it["done"] = True
             classified += 1
         if all(i.get("done") for i in its):
@@ -1156,6 +1157,72 @@ def compute(members, votes, q_monthly, mp_q, debates):
 
 
 # ---------------------------------------------------------------- main
+def push_to_db(mp_q):
+    """File every newly classified contribution into Supabase (the
+    permanent store), on top of the normal JSON files. An entry is
+    eligible while it still carries its debate id ('ext'); the id is
+    removed here ONLY once Supabase confirms the batch, which makes the
+    step exactly-once: successes never re-file (id gone), failures keep
+    their id and retry on the next run. The table's unique constraint is
+    a second net behind that. No credentials -> skipped, files intact."""
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if not url or not key:
+        print("DB: no Supabase credentials — skipping (files still written)")
+        return
+
+    todo = []  # (entry_ref, row) — refs let us strip ids on success
+    for mid, e in mp_q.items():
+        for x in e.get("deb_ex", []):
+            if not (isinstance(x, dict) and x.get("ext")
+                    and x.get("stance") in CLASS_STANCES):
+                continue
+            todo.append((x, {
+                "ext": str(x["ext"]),
+                "mid": str(mid),
+                "said_on": x.get("d", ""),
+                "issue": (x.get("issue") or "")[:120],
+                "stance": x.get("stance"),
+                "tone": x.get("tone"),
+                "summary": (x.get("sum") or "")[:400],
+                "quote": (x.get("t") or "")[:600],
+                "debate": (x.get("dt") or "")[:160],
+            }))
+    if not todo:
+        print("DB: nothing new to file")
+        return
+
+    endpoint = f"{url}/rest/v1/speech"
+    headers = {
+        "apikey": key,
+        "authorization": f"Bearer {key}",
+        "content-type": "application/json",
+        # merge-duplicates => rows already present are ignored, not errored
+        "prefer": "resolution=merge-duplicates,return=minimal",
+    }
+    sent, failed = 0, 0
+    for i in range(0, len(todo), 500):
+        batch = todo[i:i + 500]
+        try:
+            r = requests.post(endpoint, headers=headers,
+                              data=json.dumps([row for _, row in batch]),
+                              timeout=120)
+            if r.status_code in (200, 201, 204):
+                sent += len(batch)
+                for entry, _ in batch:          # confirmed: won't re-file
+                    entry.pop("ext", None)
+                    entry.pop("dt", None)
+            else:
+                failed += len(batch)
+                if failed <= 500:  # print the first failure's reason once
+                    print(f"DB: HTTP {r.status_code} — {r.text[:200]}")
+        except Exception as exc:
+            failed += len(batch)
+            print(f"DB: batch failed ({exc})")
+    print(f"DB: filed {sent} contributions to Supabase"
+          + (f", {failed} failed (will retry next run)" if failed else ""))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["backfill", "nightly"], default="nightly")
@@ -1226,6 +1293,11 @@ def main():
                 del mq["ex"]
 
     compute(members, votes, q_monthly, mp_q, debates)
+
+    # file newly classified speech into the permanent store (Supabase);
+    # push_to_db removes each entry's debate id only on confirmed
+    # success, so failures keep their id and retry on the next run
+    push_to_db(mp_q)
 
     save("state.json", state)
     save("votes.json", votes)
