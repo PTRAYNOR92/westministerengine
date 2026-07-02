@@ -1016,6 +1016,23 @@ def compute(members, votes, q_monthly, mp_q, debates):
         months = sorted(q["months"])[-12:]
         bodies = sorted(q["bodies"].items(), key=lambda kv: -kv[1])[:4]
         bsum = sum(v for _, v in bodies) or 1
+        cls = [e for e in q.get("deb_ex", [])
+               if isinstance(e, dict) and e.get("stance") in CLASS_STANCES]
+        said = None
+        if cls:
+            cls = sorted(cls, key=lambda e: e.get("d", ""))
+            sc, tc = defaultdict(int), defaultdict(int)
+            for e in cls:
+                sc[e["stance"]] += 1
+                tc[e.get("tone", "measured")] += 1
+            said = {"n": len(cls), "stance": dict(sc), "tone": dict(tc),
+                    "recent": [{"d": e.get("d", ""),
+                                "issue": e.get("issue", ""),
+                                "stance": e["stance"],
+                                "tone": e.get("tone", ""),
+                                "sum": e.get("sum", ""),
+                                "q": e.get("t", "")}
+                               for e in cls[-5:]][::-1]}
         mps_out.append({
             "id": int(mid), "name": s["name"], "party": s["party"],
             "seat": s["seat"],
@@ -1031,6 +1048,7 @@ def compute(members, votes, q_monthly, mp_q, debates):
                                key=lambda kv: -kv[1])[:3],
             "spark": [q["months"].get(mo, 0) for mo in months],
             "topics": [[b, round(100 * v / bsum)] for b, v in bodies],
+            **({"said": said} if said else {}),
         })
     mps_out.sort(key=lambda m: m["name"])
     ai_mp_themes(mps_out, mp_q)
