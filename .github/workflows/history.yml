@@ -1,0 +1,31 @@
+name: History run (fill the database for a past date range)
+
+on:
+  workflow_dispatch:
+    inputs:
+      frm:
+        description: "From date (YYYY-MM-DD)"
+        required: true
+      to:
+        description: "To date (YYYY-MM-DD)"
+        required: true
+
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run history classification
+        run: python pipeline/history.py --frm "${{ inputs.frm }}" --to "${{ inputs.to }}"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
