@@ -843,8 +843,11 @@ def ai_classify_debates(pending, mp_q, members):
     done_ids, classified = set(), 0
     for deb, ctx, s, e in chunks:
         its = deb["items"]
+        if all(its[j].get("done") for j in range(s, e)):
+            continue  # this span was fully marked on an earlier run
         contribs = [{"i": j, "who": who(its[j]["mid"]),
-                     "classify": j >= s, "text": its[j]["txt"]}
+                     "classify": j >= s and not its[j].get("done"),
+                     "text": its[j]["txt"]}
                     for j in range(ctx, e)]
         payload = {"debate": deb["title"], "date": deb["d"],
                    "contributions": contribs}
@@ -874,8 +877,10 @@ def ai_classify_debates(pending, mp_q, members):
             print(f"Classify: chunk failed ({exc}) — will retry")
             continue
         for j in range(s, e):
-            g = results.get(j)
             it = its[j]
+            if it.get("done"):
+                continue  # already stored on an earlier run — never twice
+            g = results.get(j)
             if not g:
                 continue
             stance = str(g.get("stance", "")).strip().lower()
@@ -1265,6 +1270,29 @@ def main():
 
     ai_classify_debates(pending, mp_q, members)
     save("pending_class.json", pending)
+
+    # sweep out accidental double verdicts (same MP, same day, same
+    # verbatim quote = the same speech marked twice). Where a pair
+    # exists, keep the copy still carrying its debate id so it can
+    # file to the database; counts and cards then read clean.
+    for mq in mp_q.values():
+        dex = mq.get("deb_ex")
+        if not dex:
+            continue
+        seen, keep = {}, []
+        for x in dex:
+            k = ((x.get("d"), x.get("t"))
+                 if isinstance(x, dict) and x.get("t") else None)
+            if k is None:
+                keep.append(x)
+                continue
+            if k in seen:
+                if "ext" in x and "ext" not in keep[seen[k]]:
+                    keep[seen[k]] = x
+                continue
+            seen[k] = len(keep)
+            keep.append(x)
+        mq["deb_ex"] = keep
 
     # drop AI-gloss sample texts from months too old to trend
     keep = {(date.today() - timedelta(days=i * 30)).isoformat()[:7]
