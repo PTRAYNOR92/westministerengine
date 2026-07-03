@@ -581,7 +581,7 @@ def _fulltext(value_html):
     return txt[:CLASS_MAX_CHARS] if len(txt) >= 60 else ""
 
 
-def fetch_debates(state, debates, mp_q, pending):
+def fetch_debates(state, debates, mp_q, pending, until=None):
     """Debate sections (Commons Chamber + Westminster Hall) with per-MP
     contribution counts, walked day by day via the Hansard calendar:
     calendar -> sections for day -> section tree -> debate detail.
@@ -592,10 +592,12 @@ def fetch_debates(state, debates, mp_q, pending):
 
     Incremental: stored sections are never refetched; nightly runs only
     walk days since the last seen sitting date. Old entries are pruned.
+    `until` (YYYY-MM-DD) bounds the walk for history runs; None = today.
     """
     frm = state.get("last_debate_date") or \
         (date.today() - timedelta(days=DEBATE_WINDOW_DAYS)).isoformat()
-    today = date.today()
+    today = date.today() if until is None else \
+        datetime.strptime(until, "%Y-%m-%d").date()
     print(f"Fetching debate sections since {frm}…")
 
     def walk(node, out):
