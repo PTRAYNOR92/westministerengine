@@ -831,7 +831,12 @@ def ai_classify_debates(pending, mp_q, members):
         'indignation and "impassioned" for real intensity without '
         'hostility. Calm settled opposition is "opposing" + "measured".\n'
         "- issue: the subject in 1-3 plain words (e.g. 'Gaza', "
-        "'rail fares', 'school funding').\n"
+        "'rail fares', 'school funding'). Use the SAME issue wording for "
+        "every contribution about the same subject: near-identical names "
+        "('SEND funding' / 'SEND provision' / 'SEND reform') are ONE "
+        "issue — pick the broadest natural name (here simply 'SEND') and "
+        "reuse it exactly. Specifics belong in the summary, not the "
+        "issue name. Singular nouns, no punctuation.\n"
         "- sum: one or two short plain-English sentences on what the "
         "speaker is doing (e.g. 'Welcomes the sanctions but says they "
         "fall short and calls for a full arms embargo.').\n"
