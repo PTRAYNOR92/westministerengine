@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The Commons Index — what is Parliament talking about?</title>
+<title>The Commons Index: what is Parliament talking about?</title>
 <meta name="description" content="Every question counted, every division tracked, every MP profiled. Computed nightly from the official parliamentary record.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -77,10 +77,24 @@ footer a{color:var(--dim)}
 .empty{padding:60px 20px;text-align:center;color:var(--dim);font:15px var(--disp)}
 .growth{font:700 15px var(--mono)}
 spark{display:inline-block}
+.hrow{border-top:1px solid var(--border);padding:12px 2px}
+.hrow .top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+.hscore{font:700 24px var(--disp);min-width:64px;text-align:right}
+.hrank{font:600 11px var(--mono);color:var(--faint);min-width:22px;text-align:right}
+.hissue{font:600 15px var(--disp)}
+.hverdict{font-size:12.5px;color:var(--dim);margin:3px 0 0 100px;max-width:720px}
+.hmeta{display:flex;gap:10px;align-items:center;margin-left:auto;flex-wrap:wrap}
+.tchip{font:600 10px var(--mono);padding:2px 7px;border-radius:99px;border:1px solid}
+.pill{font:600 12px var(--disp);padding:7px 14px;border-radius:99px;border:1px solid var(--border);
+  background:transparent;color:var(--dim);cursor:pointer;transition:.12s}
+.pill.on{background:rgba(124,107,255,.14);border-color:var(--violet);color:var(--text)}
+.receipt{border-left:2px solid var(--border);padding:6px 12px;margin:8px 0 8px 100px;font-size:12.5px;color:var(--dim)}
+.receipt b{color:var(--text);font-weight:600}
+@media(max-width:700px){.hverdict,.receipt{margin-left:0}}
 </style>
 </head>
 <body>
-<div class="banner" id="banner" style="display:none">SAMPLE DATA — the engine has not run yet. Run the Backfill workflow on GitHub, then refresh.</div>
+<div class="banner" id="banner" style="display:none">SAMPLE DATA. The engine has not run yet. Run the Backfill workflow on GitHub, then refresh.</div>
 <div class="wrap">
   <header>
     <div class="head">
@@ -88,7 +102,7 @@ spark{display:inline-block}
         <div class="eyebrow">THE COMMONS INDEX</div>
         <h1>The Commons Index</h1>
         <p class="sub">What is Parliament talking about? We identify trends and momentum
-        through data — every question counted, every division tracked, computed nightly
+        through data: every question counted, every division tracked, computed nightly
         from the official record.</p>
         <a href="https://www.linkedin.com/newsletters/the-commons-index-7472042334084579328/"
            target="_blank" rel="noopener"
@@ -109,12 +123,13 @@ const pcol = p => PARTY[p] || "#8A94A8";
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
-let DATA = {}, tab = "momentum", selMP = null, query = "", selDept = "";
+let DATA = {}, tab = "heat", selMP = null, query = "", selDept = "";
+let heatWin = "fortnight", heatBench = "all", heatOpen = -1;
 
-const TABS = [["momentum","Momentum"],["mps","MP intelligence"],["leagues","League tables"],["about","About"]];
+const TABS = [["heat","Heat board"],["policy","Policy areas"],["mps","MP intelligence"],["leagues","League tables"],["momentum","Momentum"],["about","About"]];
 
 async function boot(){
-  const files = ["meta","mps","topics","leagues"];
+  const files = ["meta","mps","topics","leagues","heat","sentiment"];
   for (const f of files){
     try { DATA[f] = await (await fetch(`data/${f}.json?v=${Date.now()}`)).json(); }
     catch(e){ DATA[f] = null; }
@@ -141,14 +156,171 @@ function spark(values, color){
     <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round"/></svg>`;
 }
 
+
+
+/* ---------- POLICY AREAS ---------- */
+function renderPolicy(){
+  const H = DATA.heat;
+  const W = H?.[heatWin];
+  if(!W?.areas?.length) return `<div class="panel"><div class="empty">No policy data yet. It appears after the next nightly run.</div></div>`;
+  const cards = W.areas.map((a,i) => `
+    <div class="panel">
+      <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+        <span class="hrank">${i+1}</span>
+        <span class="hscore" style="color:${heatColor(a.heat)};min-width:0">${a.heat.toFixed(2)}</span>
+        <span class="hissue">${esc(a.area)}</span>
+        <span class="faint mono" style="font-size:10px;margin-left:auto">${a.n} CONTRIBUTIONS</span>
+      </div>
+      ${(a.top||[]).map(t => `
+        <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border);font-size:13px">
+          <span class="mono" style="font-size:11px;font-weight:600;color:${heatColor(t.heat)};min-width:36px;text-align:right">${t.heat.toFixed(2)}</span>
+          <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.issue)}</span>
+          <span class="mono faint" style="font-size:10px;margin-left:auto;flex-shrink:0">${t.n}</span>
+        </div>`).join("")}
+      ${a.voices ? `
+        <div class="label" style="margin-top:12px">The cast
+          <span class="tip faint" title="Three different readings from the same record. Most vocal: who spoke most on this area, with the strength of feeling they spoke at. On the attack: who ran hottest when challenging the government position, needing at least 5 challenging contributions to qualify. Asking most: who asked the most genuine questions">&#9432;</span></div>
+        ${[["vocal","Most vocal"],["attack","On the attack"],["seeking","Asking most"]]
+          .filter(([k]) => a.voices[k])
+          .map(([k,lbl]) => { const v = a.voices[k]; return `
+          <div style="display:flex;gap:8px;align-items:baseline;padding:5px 0;border-top:1px solid var(--border);font-size:12.5px">
+            <span class="mono faint" style="font-size:10px;width:86px;flex-shrink:0">${lbl.toUpperCase()}</span>
+            ${pdot(v.party)}
+            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(v.who)}</span>
+            <span class="mono dim" style="font-size:11px;margin-left:auto;flex-shrink:0">${esc(v.v)} <span class="faint" style="font-weight:400">${esc(v.note)}</span></span>
+          </div>`;}).join("")}` : ""}
+    </div>`).join("");
+  return `<div class="panel" style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+      <div>
+        <div class="label">Policy areas &middot; where the strength of feeling sits</div>
+        <p class="dim" style="font-size:12.5px;max-width:720px;margin:4px 0 2px">
+          The same scores as the Heat board, added up by policy area. Every issue is filed
+          under one of twelve areas, and each area shows the average strength of feeling
+          across everything MPs said on its issues, with the three most charged issues
+          listed inside. So this page answers a different question to the board: not which
+          single row is running hottest, but which part of government's in-tray Parliament
+          feels most strongly about.</p>
+        <div class="faint" style="font-size:11.5px;margin-top:4px">${esc(W.from)} to ${esc(W.to)} &middot; updated ${esc(H.updated)}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="pill ${heatWin==="fortnight"?"on":""}" onclick="heatWin='fortnight';render()">Last 10 sitting days</button>
+        <button class="pill ${heatWin==="quarter"?"on":""}" onclick="heatWin='quarter';render()">Last quarter</button>
+      </div>
+    </div>
+  </div>
+  <div class="grid g2">${cards}</div>`;
+}
+
+/* ---------- HEAT BOARD ---------- */
+const TONE_STYLE = {heated:"--hot", impassioned:"--warm", concerned:"--cyan", measured:"--dim", warm:"--cool"};
+const HEAT_W_JS = {heated:3, impassioned:2, concerned:1, measured:0, warm:0};
+
+function computeHeatRows(board, bench){
+  /* Pure: takes the baked issue list and a bench key ("all"|"gb"|"opp"),
+     returns rows recomputed and re-sorted for that bench. */
+  if(!board) return [];
+  if(bench === "all")
+    return board.map(it => ({...it, vN: it.n, vHeat: it.heat}));
+  return board
+    .map(it => {
+      const b = (it.bench||{})[bench];
+      if(!b || b[0] < 5) return null;           /* bench floor: 5 */
+      return {...it, vN: b[0], vHeat: Math.round(100*b[1]/b[0])/100};
+    })
+    .filter(Boolean)
+    .sort((a,b) => b.vHeat - a.vHeat || b.vN - a.vN);
+}
+
+function heatColor(h){ return h >= 1 ? "var(--hot)" : h >= 0.5 ? "var(--warm)" : "var(--dim)"; }
+
+function trendBadge(t){
+  if(t === null || t === undefined) return `<span class="faint mono" style="font-size:10px">NEW</span>`;
+  if(t > 0.05)  return `<span class="hot mono" style="font-size:11px">&#9650; +${t.toFixed(2)}</span>`;
+  if(t < -0.05) return `<span class="cool mono" style="font-size:11px">&#9660; ${t.toFixed(2)}</span>`;
+  return `<span class="faint mono" style="font-size:10px">STEADY</span>`;
+}
+
+function toneChips(tones){
+  return ["heated","impassioned","concerned"].filter(t => tones?.[t])
+    .map(t => `<span class="tchip" style="color:var(${TONE_STYLE[t]});border-color:currentColor">${tones[t]} ${t}</span>`)
+    .join("");
+}
+
+const STANCE_META = [["supporting","Backing the government","var(--warm)"],
+  ["pushing further","Pushing it to go further","var(--violet)"],
+  ["opposing","Opposing","var(--hot)"],
+  ["seeking","Asking questions","var(--cool)"],
+  ["constituency","Raising local cases","var(--dim)"]];
+
+function stanceBar(st, n){
+  if(!st || !n) return "";
+  const tip = STANCE_META.filter(([k])=>st[k]>0)
+    .map(([k,lbl])=>`${lbl}: ${Math.round(100*st[k]/n)}%`).join("  ·  ");
+  const segs = STANCE_META.filter(([k])=>st[k]>0)
+    .map(([k,,col])=>`<i style="display:block;height:100%;float:left;width:${100*st[k]/n}%;background:${col}"></i>`).join("");
+  return `<span class="tip" title="What speakers were doing. ${tip}" style="width:92px;height:7px;border-radius:99px;overflow:hidden;display:inline-block;background:var(--border);vertical-align:middle">${segs}</span>`;
+}
+
+function stanceChips(st, n){
+  if(!st || !n) return "";
+  return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 2px 100px">
+    ${STANCE_META.filter(([k])=>st[k]>0)
+      .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${Math.round(100*st[k]/n)}%</span>`).join("")}
+  </div>`;
+}
+
+function renderHeat(){
+  const H = DATA.heat;
+  if(!H) return `<div class="panel"><div class="empty">No heat data yet. The next nightly run will bake it. If this persists, check the engine ran green on GitHub.</div></div>`;
+  const W = H[heatWin] || {issues:[]};
+  const rows = computeHeatRows(W.issues, heatBench);
+  const benchLabel = {all:"All benches", gb:"Government backbench", opp:"Opposition"};
+  const list = rows.map((it,i) => `<div class="hrow">
+      <div class="top">
+        <span class="hrank">${i+1}</span>
+        <span class="hscore" style="color:${heatColor(it.vHeat)}">${it.vHeat.toFixed(2)}</span>
+        <span class="hissue">${esc(it.issue)}</span>
+        <div class="hmeta">
+          ${trendBadge(it.trend)}
+          ${toneChips(it.tones)}
+          ${stanceBar(it.stances, it.n)}
+          <span class="faint mono" style="font-size:10px">${it.vN} CONTRIBUTIONS</span>
+        </div>
+      </div>
+      ${it.verdict ? `<div class="hverdict">${esc(it.verdict)}</div>` : ""}
+    </div>`).join("") || `<div class="empty">Nothing clears the floor for this view. Try All benches or the quarter window.</div>`;
+
+  return `<div class="panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px">
+      <div>
+        <div class="label">Heat board &middot; the issues MPs feel most strongly about</div><p class="dim" style="font-size:12.5px;max-width:720px;margin:4px 0 2px">Every contribution MPs make in debate is read and given a score for how strongly it was delivered: an angry speech scores highest, an anguished or worried one sits in the middle, and routine businesslike remarks score zero. Each issue below shows the average of those scores, so what rises to the top is not what Parliament discussed most, but what it felt most strongly about when it did. Hover the colour bar on any row for the mix of what speakers were doing.</p>
+        <div class="faint" style="font-size:11.5px">${esc(W.from)} to ${esc(W.to)} &middot; updated ${esc(H.updated)}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="pill ${heatWin==="fortnight"?"on":""}" onclick="event.stopPropagation();heatWin='fortnight';heatOpen=-1;render()">Last 10 sitting days</button>
+        <button class="pill ${heatWin==="quarter"?"on":""}" onclick="event.stopPropagation();heatWin='quarter';heatOpen=-1;render()">Last quarter</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+      ${Object.entries(benchLabel).map(([k,l]) =>
+        `<button class="pill ${heatBench===k?"on":""}" onclick="event.stopPropagation();heatBench='${k}';heatOpen=-1;render()">${l}</button>`).join("")}
+    </div>
+    ${list}
+    <div class="faint" style="font-size:11px;margin-top:14px;line-height:1.6">
+      How the score works, in plain terms: every time an MP speaks on an issue, their contribution is scored 3 if it was angry, 2 if impassioned, 1 if worried, and 0 if it was routine business or friendly. The issue&rsquo;s number is the average, so it runs from 0 (everyone stayed businesslike) to 3 (every single contribution was furious). In practice anything above 1 is a strikingly charged debate. How often an issue comes up is only used as an entry bar: it needs ${W.floor||10} contributions in the window to appear at all (5 when filtering to a single side of the House), so one angry speech cannot top the chart on its own. Built from what MPs say out loud in the Commons Chamber and Westminster Hall; written questions are formal documents with the feeling drafted out, so they are tracked elsewhere on this site but not scored here. The small colour bar on each row shows the mix of what speakers were doing: backing the government, pushing it to go further, opposing, asking questions, or raising local cases. Hover it for the percentages. Rebuilt nightly from the full official record since January 2026. Behind every number sits a verbatim quote in our archive, and you can read each MP&rsquo;s own receipts on their card in MP intelligence.
+    </div>
+  </div>`;
+}
+
 /* ---------- MOMENTUM ---------- */
 function renderMomentum(){
   const t = DATA.topics;
-  if(!t?.length) return `<div class="empty">No topic data yet — run the backfill on GitHub.</div>`;
+  if(!t?.length) return `<div class="empty">No topic data yet. Run the backfill on GitHub.</div>`;
   return `<div class="grid" style="gap:12px">
     <p class="dim" style="font-size:12.5px;max-width:760px">
       Ranked by <span class="tip" title="Questions in the last ~90 days versus the previous ~90 days">growth, not size</span>.
-      The biggest subjects are always big — this page shows what's suddenly getting attention instead.</p>
+      The biggest subjects are always big. This page shows what's suddenly getting attention instead.</p>
     ${t.map((x,i)=>`
     <div class="panel">
       <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:8px">
@@ -185,7 +357,7 @@ function renderMomentum(){
 /* ---------- MPs ---------- */
 function renderMPs(){
   const mps = DATA.mps;
-  if(!mps?.length) return `<div class="empty">No MP data yet — run the backfill on GitHub.</div>`;
+  if(!mps?.length) return `<div class="empty">No MP data yet. Run the backfill on GitHub.</div>`;
   const q = query.toLowerCase();
   const list = mps.filter(m => !q || m.name.toLowerCase().includes(q) ||
     (m.seat||"").toLowerCase().includes(q) || (m.party||"").toLowerCase()===q);
@@ -198,7 +370,7 @@ function renderMPs(){
     const t={W:"Voted with party majority",R:"Voted against party majority",A:"Did not vote"}[v]||"";
     return `<span class="chip" title="${t}" style="color:${m[1]};background:color-mix(in srgb,${m[1]} 12%,transparent);border:1px solid color-mix(in srgb,${m[1]} 40%,transparent)">${m[0]}</span>`;
   }).join("");
-  return `<div class="grid" style="grid-template-columns:280px 1fr;align-items:start">
+  return `<p class="dim" style="font-size:12.5px;max-width:760px;margin-bottom:12px">One card per MP: what they pursue in written questions, when they vote against their own party, and how they actually sound in debate. Every claim carries a verbatim quote; hover to see it.</p><div class="grid" style="grid-template-columns:280px 1fr;align-items:start">
     <div>
       <input class="search" placeholder="Search ${mps.length} MPs, seats, parties…" value="${esc(query)}"
         oninput="query=this.value;render(true)">
@@ -231,22 +403,66 @@ function renderMPs(){
         <div class="stat"><div class="n">${mp.participation}%</div>
           <div class="l"><span class="tip" title="Share of all Commons divisions this parliament in which they cast a vote">DIVISION PARTICIPATION</span></div></div>
         <div class="stat"><div class="n">${(mp.spoken||0).toLocaleString()}</div>
-          <div class="l"><span class="tip" title="Spoken contributions recorded in Hansard this parliament — speeches, interventions and oral answers">SPOKEN CONTRIBUTIONS</span></div></div>
+          <div class="l"><span class="tip" title="Spoken contributions recorded in Hansard this parliament: speeches, interventions and oral answers">SPOKEN CONTRIBUTIONS</span></div></div>
         <div class="stat"><div class="n">${mp.questions}</div>
           <div class="l"><span class="tip" title="Written parliamentary questions tabled this parliament">WRITTEN QUESTIONS</span></div>
           <div style="margin-top:6px">${spark(mp.spark, c)}</div></div>
       </div>
-      ${(mp.rebellionVotes||[]).length ? `
+      <div style="margin-top:26px;padding-top:14px;border-top:2px solid var(--border)"><div style="font:700 12px var(--mono);letter-spacing:2px;text-transform:uppercase;color:var(--violet)">In the chamber</div><div class="faint" style="font-size:11.5px;margin-top:2px">What they say out loud in debate, and how strongly they say it. Every reading is backed by a real quote; hover a line to read it.</div></div>
+      ${(() => {
+        const tr = DATA.sentiment?.mps?.[String(mp.id)];
+        if(!tr?.t?.length) return "";
+        const live = tr.t.filter(x => x[1] > 0);
+        if(live.length < 2) return "";
+        const MN = {"01":"Jan","02":"Feb","03":"Mar","04":"Apr","05":"May","06":"Jun","07":"Jul","08":"Aug","09":"Sep","10":"Oct","11":"Nov","12":"Dec"};
+        const last = live[live.length-1][2];
+        const col = last >= 1 ? "var(--hot)" : last >= 0.5 ? "var(--warm)" : "var(--cool)";
+        return `<div style="margin-top:18px">
+          <div class="label">How their tone is changing
+            <span class="tip faint" title="Everything this MP says in debate is scored each month for how strongly it was said. An angry contribution scores highest, an anguished or worried one sits in the middle, and routine businesslike remarks score zero. The line shows the monthly average, so you can see at a glance whether they are getting more worked up or calming down. Months where they barely spoke count for little.">AI &#9432;</span></div>
+          <div style="display:flex;align-items:center;gap:12px;margin-top:6px">
+            ${spark(tr.t.map(x=>x[2]), col)}
+            <span style="font-size:12.5px" class="dim">${esc(tr.s || "")}
+              <span class="faint">&middot; ${MN[live[0][0]]} to ${MN[live[live.length-1][0]]}</span></span>
+          </div>
+        </div>`;
+      })()}
+      ${mp.said?`
       <div style="margin-top:18px">
-        <div class="label">Where they broke with party
-          <span class="tip faint" title="The exact divisions counted as rebellions — so you can judge them yourself">ⓘ</span></div>
-        ${mp.rebellionVotes.slice(-8).reverse().map(r=>`
-          <div style="display:flex;gap:10px;align-items:baseline;padding:5px 0;border-top:1px solid var(--border);font-size:12px">
+        <div class="label">How they're speaking · last 6 months
+          <span class="tip faint" title="AI-read nightly from their full debate contributions, each judged in the context of its whole exchange. Stance is measured against the government position, never the previous speaker: supporting, pushing further (backs the direction but demands more), opposing, seeking (genuinely asking), constituency (local case). Tone is judged independently; measured is the default and heat must be earned. Every line carries a verbatim quote; hover to see it.">AI ⓘ</span></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
+          ${[["supporting","Supporting","var(--warm)"],["pushing further","Pushing further","var(--violet)"],["opposing","Opposing","var(--hot)"],["seeking","Seeking","var(--cool)"],["constituency","Constituency","var(--dim)"]]
+            .filter(([k])=>((DATA.sentiment?.mps?.[String(mp.id)]?.c?.st) || mp.said.stance)[k]>0)
+            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${((DATA.sentiment?.mps?.[String(mp.id)]?.c?.st) || mp.said.stance)[k]}</span>`).join("")}
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
+          ${[["heated","Heated","var(--hot)"],["impassioned","Impassioned","var(--violet)"],["concerned","Concerned","var(--warm)"],["measured","Measured","var(--dim)"],["warm","Warm","var(--cool)"]]
+            .filter(([k])=>((DATA.sentiment?.mps?.[String(mp.id)]?.c?.tn) || mp.said.tone)[k]>0)
+            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${((DATA.sentiment?.mps?.[String(mp.id)]?.c?.tn) || mp.said.tone)[k]}</span>`).join("")}
+        </div>
+        ${(mp.said.recent||[]).map(r=>`
+          <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border);font-size:12.5px"
+               title="&ldquo;${esc(r.q)}&rdquo;">
             <span class="mono faint" style="flex-shrink:0">${esc(r.d)}</span>
-            <span class="dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.t)}</span>
+            <span style="min-width:0"><b>${esc(r.issue)}</b>
+              <span class="mono faint" style="font-size:10px"> ${esc(r.stance)} · ${esc(r.tone)}</span>
+              <span class="dim">&middot; ${esc(r.sum)}</span></span>
           </div>`).join("")}
-        ${mp.rebellionVotes.length>8?`<div class="faint" style="font-size:11px;margin-top:5px">+ ${mp.rebellions-8} more</div>`:""}
+        <div class="faint" style="font-size:11px;margin-top:6px">Their five most recent readings. The counts above cover everything they have said in debate over that whole period, from the full record.</div>
       </div>`:""}
+      ${(mp.speaking||[]).length?`
+      <div style="margin-top:18px">
+        <div class="label">Speaking on &middot; ${esc(DATA.sentiment?.span || "last 6 months")}
+          <span class="tip faint" title="Debate sections in the Commons Chamber and Westminster Hall where they spoke most, by contribution count. Topics are AI-mapped from section titles; the counts are pure arithmetic.">ⓘ</span></div>
+        ${mp.speaking.map(([t,n],i)=>`
+          <div style="display:flex;gap:10px;align-items:baseline;padding:5px 0;border-top:1px solid var(--border);font-size:13px">
+            <span class="mono faint" style="font-size:11px">0${i+1}</span>
+            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t)}</span>
+            <span class="mono faint" style="font-size:11px;margin-left:auto;flex-shrink:0">${n} contributions</span>
+          </div>`).join("")}
+      </div>`:""}
+      <div style="margin-top:26px;padding-top:14px;border-top:2px solid var(--border)"><div style="font:700 12px var(--mono);letter-spacing:2px;text-transform:uppercase;color:var(--violet)">On paper</div><div class="faint" style="font-size:11.5px;margin-top:2px">The written questions they put to government: what they chase, and how they go about it.</div></div>
       ${(mp.themes||[]).length?`
       <div style="margin-top:18px">
         <div class="label">What they're pursuing · last 6 months
@@ -256,47 +472,13 @@ function renderMPs(){
                ${t.example?`title="e.g. ${esc(t.example)}"`:""}>
             <span class="mono faint" style="font-size:11px;flex-shrink:0">0${i+1}</span>
             <span style="font-size:13px;min-width:0"><b>${esc(t.subject)}</b>
-              <span class="dim">— ${esc(t.stance)}</span></span>
+              <span class="dim">&middot; ${esc(t.stance)}</span></span>
           </div>`).join("")}
         ${mp.approach?`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:10px">
           ${[["pressing","Pressing for action","var(--hot)"],["probing","Seeking information","var(--violet)"],["constituency","Constituency","var(--cool)"],["supportive","Supportive","var(--warm)"]]
             .filter(([k])=>mp.approach[k]>0)
             .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.approach[k]}</span>`).join("")}
         </div>`:""}
-      </div>`:""}
-      ${mp.said?`
-      <div style="margin-top:18px">
-        <div class="label">How they're speaking · last 6 months
-          <span class="tip faint" title="AI-read nightly from their full debate contributions, each judged in the context of its whole exchange. Stance is measured against the government position, never the previous speaker: supporting, pushing further (backs the direction but demands more), opposing, seeking (genuinely asking), constituency (local case). Tone is judged independently — measured is the default and heat must be earned. Every line carries a verbatim quote; hover to see it.">AI ⓘ</span></div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">
-          ${[["supporting","Supporting","var(--warm)"],["pushing further","Pushing further","var(--violet)"],["opposing","Opposing","var(--hot)"],["seeking","Seeking","var(--cool)"],["constituency","Constituency","var(--dim)"]]
-            .filter(([k])=>mp.said.stance[k]>0)
-            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.said.stance[k]}</span>`).join("")}
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">
-          ${[["heated","Heated","var(--hot)"],["impassioned","Impassioned","var(--violet)"],["concerned","Concerned","var(--warm)"],["measured","Measured","var(--dim)"],["warm","Warm","var(--cool)"]]
-            .filter(([k])=>mp.said.tone[k]>0)
-            .map(([k,lbl,col])=>`<span class="mono" style="font-size:10px;padding:3px 9px;border-radius:99px;color:${col};background:color-mix(in srgb,${col} 10%,transparent);border:1px solid color-mix(in srgb,${col} 35%,transparent)">${lbl} ${mp.said.tone[k]}</span>`).join("")}
-        </div>
-        ${(mp.said.recent||[]).map(r=>`
-          <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border);font-size:12.5px"
-               title="&ldquo;${esc(r.q)}&rdquo;">
-            <span class="mono faint" style="flex-shrink:0">${esc(r.d)}</span>
-            <span style="min-width:0"><b>${esc(r.issue)}</b>
-              <span class="mono faint" style="font-size:10px"> ${esc(r.stance)} · ${esc(r.tone)}</span>
-              <span class="dim">— ${esc(r.sum)}</span></span>
-          </div>`).join("")}
-      </div>`:""}
-      ${(mp.speaking||[]).length?`
-      <div style="margin-top:18px">
-        <div class="label">Speaking on · last 6 months
-          <span class="tip faint" title="Debate sections in the Commons Chamber and Westminster Hall where they spoke most, by contribution count. Topics are AI-mapped from section titles; the counts are pure arithmetic.">ⓘ</span></div>
-        ${mp.speaking.map(([t,n],i)=>`
-          <div style="display:flex;gap:10px;align-items:baseline;padding:5px 0;border-top:1px solid var(--border);font-size:13px">
-            <span class="mono faint" style="font-size:11px">0${i+1}</span>
-            <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t)}</span>
-            <span class="mono faint" style="font-size:11px;margin-left:auto;flex-shrink:0">${n} contributions</span>
-          </div>`).join("")}
       </div>`:""}
       <div style="margin-top:18px">
         <div class="label">Question subjects · share of output
@@ -306,8 +488,20 @@ function renderMPs(){
             <span style="font-size:12px;width:230px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t)}</span>
             <div class="bar"><i style="width:${v}%;background:${c}"></i></div>
             <span class="mono dim" style="font-size:11px;width:34px;text-align:right">${v}%</span>
-          </div>`).join("") || `<span class="faint" style="font-size:12px">${mp.roleType==="gov" ? "None — ministers answer written questions rather than table them." : "No questions tabled yet."}</span>`}
+          </div>`).join("") || `<span class="faint" style="font-size:12px">${mp.roleType==="gov" ? "None. Ministers answer written questions rather than table them." : "No questions tabled yet."}</span>`}
       </div>
+      <div style="margin-top:26px;padding-top:14px;border-top:2px solid var(--border)"><div style="font:700 12px var(--mono);letter-spacing:2px;text-transform:uppercase;color:var(--violet)">In the division lobby</div><div class="faint" style="font-size:11.5px;margin-top:2px">How they vote, including the times they walked through the door against their own party.</div></div>
+      ${(mp.rebellionVotes||[]).length ? `
+      <div style="margin-top:18px">
+        <div class="label">Where they broke with party
+          <span class="tip faint" title="The exact divisions counted as rebellions, so you can judge them yourself">ⓘ</span></div>
+        ${mp.rebellionVotes.slice(-8).reverse().map(r=>`
+          <div style="display:flex;gap:10px;align-items:baseline;padding:5px 0;border-top:1px solid var(--border);font-size:12px">
+            <span class="mono faint" style="flex-shrink:0">${esc(r.d)}</span>
+            <span class="dim" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.t)}</span>
+          </div>`).join("")}
+        ${mp.rebellionVotes.length>8?`<div class="faint" style="font-size:11px;margin-top:5px">+ ${mp.rebellions-8} more</div>`:""}
+      </div>`:""}
     </div>
   </div>`;
 }
@@ -315,7 +509,7 @@ function renderMPs(){
 /* ---------- LEAGUES ---------- */
 function renderLeagues(){
   const L = DATA.leagues;
-  if(!L) return `<div class="empty">No league data yet — run the backfill on GitHub.</div>`;
+  if(!L) return `<div class="empty">No league data yet. Run the backfill on GitHub.</div>`;
   const block = (title, subtitle, tipText, rows, fmt) => `
     <div class="panel">
       <div class="label"><span class="tip" title="${tipText}">${title}</span></div>
@@ -328,9 +522,13 @@ function renderLeagues(){
           <span class="mono" style="font-weight:600">${fmt(r)}</span>
         </div>`).join("") || '<div class="faint" style="font-size:12px">Awaiting data.</div>'}
     </div>`;
-  return `<div class="grid g2">
-    ${block("Independence index","How often they rebel, relative to their party","Rebellions relative to their own party's average — measured this way because four rebellions in a tightly-whipped party mean far more than four in a loose one", L.independence, r=>r.v+"× party avg <span class='faint'>("+r.raw+" rebellions)</span>")}
-    ${block("Chamber voice","Spoken contributions this parliament","Spoken contributions recorded in Hansard this parliament — speeches, interventions and oral answers", L.voice, r=>(r.v||0).toLocaleString()+" <span class='faint' style='font-weight:400'>contributions</span>")}
+  return `<p class="dim" style="font-size:12.5px;max-width:760px;margin-bottom:12px">The Commons, ranked from the full public record rather than press coverage. Every table has a floor so a small sample cannot top a chart.</p><div class="grid g2">
+    ${DATA.sentiment?.leagues ? `
+    ${block("The attack index","Who runs hottest when taking the government on, last 3 months","Built from an MP's challenging contributions only: everything they said that opposed the government position or pushed it to go further. Each is scored for how strongly it was said (angry 3, impassioned 2, worried 1, routine 0) and this is the average, from 0 to 3. At least 10 challenging contributions are needed to qualify, so ministers drop out naturally and one outburst cannot top the table", DATA.sentiment.leagues.attack, r=>r.v.toFixed(2)+" <span class='faint' style='font-weight:400'>of 3</span>")}
+    ${block("Rising voices","Whose tone has climbed most in recent months","MPs whose contributions have been getting steadily more forceful: their score over the last two active months compared with their earlier average. Only months where they spoke at least 5 times count towards the comparison", DATA.sentiment.leagues.escalators, r=>r.v+" <span class='faint' style='font-weight:400'>rise</span>")}
+    ${block("The calm operators","The most level-tempered of the frequent speakers, last 3 months","The lowest scores among MPs who spoke at least 40 times in the last three months: the people who talk a lot and never raise the temperature. Deputy Speakers and whips live here by design, which is a good sign the reading works", DATA.sentiment.leagues.calm, r=>r.v.toFixed(2)+" <span class='faint' style='font-weight:400'>of 3</span>")}` : ""}
+    ${block("Independence index","How often they rebel, relative to their party","Rebellions relative to their own party's average, measured this way because four rebellions in a tightly-whipped party mean far more than four in a loose one", L.independence, r=>r.v+"× party avg <span class='faint'>("+r.raw+" rebellions)</span>")}
+    ${block("Chamber voice","Spoken contributions this parliament","Spoken contributions recorded in Hansard this parliament: speeches, interventions and oral answers", L.voice, r=>(r.v||0).toLocaleString()+" <span class='faint' style='font-weight:400'>contributions</span>")}
     ${block("Scrutiny volume","Written questions tabled this parliament","Written questions tabled this parliament. Ministers answer questions rather than table them, so frontbenchers rank low by design", L.scrutiny, r=>r.v+" <span class='faint' style='font-weight:400'>questions</span>")}
     ${block("Division presence","Share of votes attended","Share of all divisions voted in", L.presence, r=>r.v+"% <span class='faint' style='font-weight:400'>of votes</span>")}
   </div>
@@ -338,7 +536,7 @@ function renderLeagues(){
   <div class="panel" style="margin-top:14px">
     <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:baseline;gap:10px">
       <div class="label">By policy area
-        <span class="tip faint" title="Top askers of written questions per answering department, this parliament. Pure counts — no AI involved.">ⓘ</span></div>
+        <span class="tip faint" title="Top askers of written questions per answering department, this parliament. Pure counts, no AI involved.">ⓘ</span></div>
       <select id="dept-pick" onchange="selDept=this.value;render()"
         style="background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:8px;padding:7px 10px;color:var(--fg);font:600 12px var(--disp);max-width:100%">
         ${Object.keys(L.policy).map(d=>`<option value="${esc(d)}" ${d===selDept?"selected":""}>${esc(d)}</option>`).join("")}
@@ -346,7 +544,7 @@ function renderLeagues(){
     </div>
     ${(()=>{const d=L.policy[selDept]||L.policy[Object.keys(L.policy)[0]];if(!d)return"";
       return `<div class="faint" style="font-size:11px;margin:8px 0 8px">${d.total.toLocaleString()} written questions tabled to this department this parliament</div>`+
-      `<div class="label" style="margin-top:8px">Top askers — written questions</div>`+
+      `<div class="label" style="margin-top:8px">Top askers &middot; written questions</div>`+
       d.top.map((r,i)=>`
       <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border)">
         <span class="mono faint" style="font-size:11px;width:20px">${String(i+1).padStart(2,"0")}</span>
@@ -356,7 +554,7 @@ function renderLeagues(){
         <span class="mono" style="font-size:12px;margin-left:auto">${r.n} <span class="faint" style="font-weight:400">questions</span></span>
       </div>`).join("")+
       ((d.speakers||[]).length?`<div class="label" style="margin-top:16px">Most active in debates
-        <span class="tip faint" title="Contributions in debate sections AI-mapped to this department — Chamber and Westminster Hall, last ~6 months">ⓘ</span></div>`+
+        <span class="tip faint" title="Contributions in debate sections AI-mapped to this department: Chamber and Westminster Hall, last ~6 months">ⓘ</span></div>`+
       d.speakers.map((r,i)=>`
       <div style="display:flex;gap:10px;align-items:baseline;padding:6px 0;border-top:1px solid var(--border)">
         <span class="mono faint" style="font-size:11px;width:20px">${String(i+1).padStart(2,"0")}</span>
@@ -383,20 +581,20 @@ function renderAbout(){
       which subjects are rising, which MPs are pursuing what, and how the conversation
       moves week to week.</p>
       <p>Everything starts from the official Hansard record: every written question,
-      every division, and every debate section in the Commons Chamber and Westminster Hall —
-      including bill stages, oral questions, urgent questions and statements — counted nightly.
+      every division, and every debate section in the Commons Chamber and Westminster Hall,
+      including bill stages, oral questions, urgent questions and statements, counted nightly.
       Select committees are not yet included. The counts and rankings are pure
       arithmetic. The short written summaries are AI-generated from the underlying
       question texts and are marked ⓘ wherever they appear.</p>
       <p><strong style="color:var(--fg)">A note of caution.</strong> Classifying tone
-      and intent in parliamentary language is inherently hard (even for an AI tool!) —
+      and intent in parliamentary language is inherently hard (even for an AI tool!), so
       for example, a question can be read as a friendly prompt or a loaded challenge.
       Using AI we classify every data point and the broad trends hold up well, but any
       individual classification can misfire, so read the AI-derived elements with
       appropriate caution and check the underlying questions, which are always shown.</p>
       <h3 style="font:600 17px var(--disp);color:var(--fg);margin:20px 0 8px">About me</h3>
       <p>I'm Patrick, and have been working in public affairs for over a decade. I have
-      built this as an independent project — it has no connection to Parliament. I'd
+      built this as an independent project; it has no connection to Parliament. I'd
       genuinely love to know what you think: impressions, corrections, ideas. Corrections
       are always welcome and acted on.</p>
     </div>
@@ -432,15 +630,17 @@ async function sendContact(){
     const r = await fetch(FORM_ENDPOINT, {method:"POST",
       headers:{"Content-Type":"application/json","Accept":"application/json"},
       body: JSON.stringify({email, message: msg})});
-    if(r.ok){ status.textContent = "Sent — thank you!";
+    if(r.ok){ status.textContent = "Sent. Thank you!";
       document.getElementById("cf-msg").value = ""; }
-    else status.textContent = "Something went wrong — please try again later.";
-  }catch(e){ status.textContent = "Something went wrong — please try again later."; }
+    else status.textContent = "Something went wrong. Please try again later.";
+  }catch(e){ status.textContent = "Something went wrong. Please try again later."; }
 }
 
 function render(keepFocus){
   const m = document.getElementById("main");
-  m.innerHTML = tab==="momentum" ? renderMomentum()
+  m.innerHTML = tab==="heat" ? renderHeat()
+              : tab==="policy" ? renderPolicy()
+              : tab==="momentum" ? renderMomentum()
               : tab==="mps" ? renderMPs()
               : tab==="about" ? renderAbout() : renderLeagues();
   if(keepFocus){ const s=m.querySelector(".search"); if(s){s.focus();s.setSelectionRange(s.value.length,s.value.length);} }
@@ -451,7 +651,7 @@ function renderFoot(){
     <strong style="color:var(--dim)">Methodology.</strong>
     All data derives from the official record via the UK Parliament Members, Commons Votes,
     Written Questions and Hansard APIs. A "rebellion" means voting against the majority of the MP's own party
-    in a division where that party voted as a bloc (at least 85% one way, at least 10 members voting) —
+    in a division where that party voted as a bloc (at least 85% one way, at least 10 members voting),
     free and conscience votes fall below that bar and are excluded by design; every counted rebellion
     is listed on the MP's card so you can judge it yourself. Spoken contributions count speeches,
     interventions and oral answers in Hansard. Participation counts tellers as not voting, and the
@@ -460,16 +660,16 @@ function renderFoot(){
     Commons Chamber and Westminster Hall are mapped to topics and departments by AI; the
     contribution counts themselves are pure arithmetic. Every figure is recomputed
     nightly from source and no count or ranking is AI-derived, with two marked exceptions: the italic
-    one-line summaries on Momentum, and the "what they're pursuing" panels on MP cards — both
+    one-line summaries on Momentum, and the "what they're pursuing" panels on MP cards, both
     AI-written nightly from the MPs' own question texts and debate excerpts, flagged ⓘ, and describing parliamentary
     conduct rather than characterising any person.<br><br>
-    ${meta.sample ? "Showing sample data — the engine has not yet run." :
+    ${meta.sample ? "Showing sample data. The engine has not yet run." :
       meta.updated ? `Last computed ${esc(meta.updated.slice(0,16).replace("T"," "))} UTC ·
       ${meta.divisions||0} divisions · ${(meta.questions||0).toLocaleString()} questions ·
       ${meta.mps||0} MPs` : "Awaiting first run."}
     · Contains parliamentary information licensed under the
     <a href="https://www.parliament.uk/site-information/copyright-parliament/open-parliament-licence/">Open Parliament Licence v3.0</a>
-    · Built by Patrick, a public affairs professional — see the About tab to get in touch. Corrections welcome.
+    · Built by Patrick, a public affairs professional. See the About tab to get in touch. Corrections welcome.
     · <a href="https://www.linkedin.com/newsletters/the-commons-index-7472042334084579328/" target="_blank" rel="noopener">The Commons Index newsletter on LinkedIn</a>.`;
 }
 boot();
