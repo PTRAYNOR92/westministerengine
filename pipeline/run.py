@@ -51,7 +51,10 @@ DEBATE_WINDOW_DAYS = 190  # how far back the debate layer looks/keeps
 CLASS_STANCES = ("supporting", "pushing further", "opposing",
                  "seeking", "constituency")
 CLASS_TONES = ("heated", "impassioned", "concerned", "measured", "warm")
-CLASS_MAX_CHARS = 6000       # reading limit per contribution (very long speeches)
+CLASS_MAX_CHARS = 4000       # reading limit per contribution (stance and
+                             # tone are always evident well before this)
+CLASS_CTX_CHARS = 350        # context-only items need just enough text to
+                             # resolve references, not the whole speech
 CLASS_CHUNK = 25             # contributions per API call
 CLASS_CHUNK_CAP = 300        # max chunks classified per night (cost guard)
 CLASS_PENDING_MAX_DAYS = 14  # unclassified material older than this degrades
@@ -852,10 +855,13 @@ def ai_classify_debates(pending, mp_q, members):
         its = deb["items"]
         if all(its[j].get("done") for j in range(s, e)):
             continue  # this span was fully marked on an earlier run
-        contribs = [{"i": j, "who": who(its[j]["mid"]),
-                     "classify": j >= s and not its[j].get("done"),
-                     "text": its[j]["txt"]}
-                    for j in range(ctx, e)]
+        contribs = []
+        for j in range(ctx, e):
+            live = j >= s and not its[j].get("done")
+            contribs.append({"i": j, "who": who(its[j]["mid"]),
+                             "classify": live,
+                             "text": its[j]["txt"] if live
+                             else its[j]["txt"][:CLASS_CTX_CHARS]})
         payload = {"debate": deb["title"], "date": deb["d"],
                    "contributions": contribs}
         try:
