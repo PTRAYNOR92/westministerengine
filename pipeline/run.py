@@ -871,7 +871,8 @@ def ai_classify_debates(pending, mp_q, members):
                                                  ensure_ascii=False)}],
             })
             if r.status_code != 200:
-                print(f"Classify: HTTP {r.status_code} — chunk skipped")
+                print(f"Classify: HTTP {r.status_code} — "
+                      f"{(r.text or '')[:140]}")
                 continue
             text = "".join(b.get("text", "")
                            for b in r.json().get("content", [])
@@ -1204,13 +1205,14 @@ def push_to_db(mp_q):
         print("DB: nothing new to file")
         return
 
-    endpoint = f"{url}/rest/v1/speech"
+    endpoint = f"{url}/rest/v1/speech?on_conflict=ext,mid,said_on,quote"
     headers = {
         "apikey": key,
         "authorization": f"Bearer {key}",
         "content-type": "application/json",
-        # merge-duplicates => rows already present are ignored, not errored
-        "prefer": "resolution=merge-duplicates,return=minimal",
+        # ignore-duplicates on that key => rows already present are
+        # silently skipped, never errored (safe on overlapping ranges)
+        "prefer": "resolution=ignore-duplicates,return=minimal",
     }
     sent, failed = 0, 0
     for i in range(0, len(todo), 500):
