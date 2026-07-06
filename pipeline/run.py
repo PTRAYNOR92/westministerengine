@@ -765,7 +765,7 @@ def ai_tag_debates(debates, headings, depts):
 
 # ---------------------------------------------------------------- compute
 # ------------------------------------------------- speech classification
-def ai_classify_debates(pending, mp_q, members):
+def ai_classify_debates(pending, mp_q, members, known_issues=None):
     """Read every new contribution IN FULL, in the context of its whole
     debate, and store a small verdict on the speaking MP: issue, stance,
     tone, a one/two-sentence summary, and a verbatim receipt quote.
@@ -840,7 +840,15 @@ def ai_classify_debates(pending, mp_q, members):
         "issue — pick the broadest natural name (here simply 'SEND') and "
         "reuse it exactly. Specifics belong in the summary, not the "
         "issue name. Singular nouns, no punctuation.\n"
-        "- sum: one or two short plain-English sentences on what the "
+        + (("- Issue names already on the card index from the last "
+            "month, most discussed first: "
+            + json.dumps(known_issues, ensure_ascii=False)
+            + ". Before coining ANY issue name, check this list; if "
+            "the subject matches one, reuse that name EXACTLY, "
+            "character for character. Coin a new name only when "
+            "nothing on the list covers the subject.\n")
+           if known_issues else "")
+        +         "- sum: one or two short plain-English sentences on what the "
         "speaker is doing (e.g. 'Welcomes the sanctions but says they "
         "fall short and calls for a full arms embargo.').\n"
         "- q: a quote of AT MOST 25 words copied VERBATIM from that "
@@ -1243,6 +1251,582 @@ def push_to_db(mp_q):
           + (f", {failed} failed (will retry next run)" if failed else ""))
 
 
+
+# ------------------------------------------------------------- heat board
+
+# tone weights: the heat formula. Heat is earned, calm scores nothing.
+HEAT_W = {"heated": 3, "impassioned": 2, "concerned": 1,
+          "measured": 0, "warm": 0}
+HEAT_FLOOR_FORT = 10     # min contributions to appear (10 sitting days)
+HEAT_FLOOR_QTR = 20      # min contributions to appear (quarter)
+HEAT_HISTORY_DAYS = 400  # how far back to read for windows + trends
+HEAT_RECEIPTS = 3        # receipt quotes per issue
+HEAT_VERDICTS = 12       # issues sent for a one-line verdict
+
+
+
+def fetch_issue_aliases():
+    """Read the issue_alias card index (variant -> canonical) so
+    splintered issue names pool together. Empty dict on any failure:
+    the board still builds, just without the merges."""
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if not url or not key:
+        return {}
+    try:
+        r = requests.get(f"{url}/rest/v1/issue_alias",
+                         params={"select": "variant,canonical",
+                                 "limit": 1000},
+                         headers={"apikey": key,
+                                  "Authorization": f"Bearer {key}"},
+                         timeout=60)
+        if r.status_code != 200:
+            print(f"heat: alias read failed HTTP {r.status_code}")
+            return {}
+        aliases = {row["variant"]: row["canonical"] for row in r.json()
+                   if row.get("variant") and row.get("canonical")}
+        print(f"heat: {len(aliases)} issue aliases loaded")
+        return aliases
+    except Exception as e:
+        print(f"heat: alias read error {e}")
+        return {}
+
+
+def fetch_recent_issue_names(aliases):
+    """Top issue names from the last 30 days, canonicalised, most
+    frequent first. Fed into the classification prompt so tonight's
+    labels reuse the existing card index instead of splintering."""
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if not url or not key:
+        return []
+    since = (date.today() - timedelta(days=30)).isoformat()
+    counts, offset = {}, 0
+    while True:
+        try:
+            r = requests.get(f"{url}/rest/v1/speech",
+                             params={"select": "issue",
+                                     "said_on": f"gte.{since}",
+                                     "limit": 1000, "offset": offset},
+                             headers={"apikey": key,
+                                      "Authorization": f"Bearer {key}"},
+                             timeout=60)
+            if r.status_code != 200:
+                print(f"classify: issue-name read failed HTTP {r.status_code}")
+                return []
+            page = r.json()
+        except Exception as e:
+            print(f"classify: issue-name read error {e}")
+            return []
+        for row in page:
+            nm = aliases.get(row.get("issue"), row.get("issue"))
+            if nm:
+                counts[nm] = counts.get(nm, 0) + 1
+        if len(page) < 1000:
+            break
+        offset += 1000
+    names = sorted(counts, key=counts.get, reverse=True)[:150]
+    print(f"classify: {len(names)} recent issue names for the prompt")
+    return names
+
+
+def fetch_speech_history():
+    """Read recent classified speech back from Supabase, oldest first.
+
+    Paginates 1,000 rows at a time. Returns [] (never crashes the run)
+    if the database is unreachable, so the site simply keeps yesterday's
+    heat.json.
+    """
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if not url or not key:
+        print("heat: no Supabase credentials — skipping heat export")
+        return []
+    since = (date.today() - timedelta(days=HEAT_HISTORY_DAYS)).isoformat()
+    rows, offset = [], 0
+    while True:
+        try:
+            r = requests.get(
+                f"{url}/rest/v1/speech",
+                params={"select": "said_on,issue,stance,tone,quote,mid",
+                        "said_on": f"gte.{since}",
+                        "order": "said_on.asc",
+                        "limit": 1000, "offset": offset},
+                headers={"apikey": key, "Authorization": f"Bearer {key}"},
+                timeout=60)
+            if r.status_code != 200:
+                print(f"heat: read failed HTTP {r.status_code} — skipping")
+                return []
+            page = r.json()
+        except Exception as e:
+            print(f"heat: read error {e} — skipping")
+            return []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        offset += 1000
+    print(f"heat: read {len(rows)} classified contributions since {since}")
+    return rows
+
+
+def _issue_key(name):
+    """Grouping key that forgives case and plural drift
+    ('Puberty blockers trial' files with 'puberty blocker trial')."""
+    toks = str(name or "").casefold().split()
+    return " ".join(t[:-1] if t.endswith("s") and len(t) > 3 else t
+                    for t in toks)
+
+
+def _bench_of(mid, members, gov_party):
+    """gb = governing-party backbencher, fr = government frontbench,
+    opp = everyone else. Unknown MPs count as opp-side 'other'."""
+    m = members.get(str(mid))
+    if not m:
+        return "opp"
+    if m.get("party") == gov_party:
+        return "fr" if m.get("roleType") == "gov" else "gb"
+    return "opp"
+
+
+def _window_board(rows, members, gov_party, floor):
+    """Aggregate one date-window of rows into a ranked issue list."""
+    agg = {}
+    for r in rows:
+        k = _issue_key(r.get("issue"))
+        if not k:
+            continue
+        a = agg.setdefault(k, {"names": {}, "tones": {}, "stances": {},
+                               "bench": {"gb": [0, 0], "opp": [0, 0],
+                                         "fr": [0, 0]},
+                               "recs": []})
+        nm = str(r.get("issue") or "").strip()
+        a["names"][nm] = a["names"].get(nm, 0) + 1
+        tone = r.get("tone") or ""
+        stance = r.get("stance") or ""
+        w = HEAT_W.get(tone, 0)
+        a["tones"][tone] = a["tones"].get(tone, 0) + 1
+        a["stances"][stance] = a["stances"].get(stance, 0) + 1
+        b = _bench_of(r.get("mid"), members, gov_party)
+        a["bench"][b][0] += 1
+        a["bench"][b][1] += w
+        if w >= 2 and r.get("quote"):
+            m = members.get(str(r.get("mid"))) or {}
+            a["recs"].append((w, r.get("said_on") or "", {
+                "who": m.get("name", "an MP"),
+                "party": m.get("party", ""),
+                "tone": tone,
+                "d": r.get("said_on") or "",
+                "q": str(r.get("quote"))[:240]}))
+    out = []
+    for k, a in agg.items():
+        n = sum(a["tones"].values())
+        if n < floor:
+            continue
+        pts = sum(HEAT_W.get(t, 0) * c for t, c in a["tones"].items())
+        recs = [r for _, _, r in
+                sorted(a["recs"], key=lambda x: (-x[0], x[1]))][:HEAT_RECEIPTS]
+        out.append({
+            "key": k,
+            "issue": max(a["names"], key=a["names"].get),
+            "n": n,
+            "heat": round(pts / n, 2),
+            "tones": a["tones"],
+            "stances": a["stances"],
+            "bench": {b: v for b, v in a["bench"].items() if v[0]},
+            "receipts": recs,
+        })
+    out.sort(key=lambda x: (-x["heat"], -x["n"]))
+    return out
+
+
+def _attach_trend(board, prev_rows, members, gov_party, floor):
+    """Trend = heat now minus heat in the previous window of the same
+    size. Needs at least half the floor in the previous window to say
+    anything; otherwise the issue is marked new."""
+    prev = {}
+    for r in prev_rows:
+        k = _issue_key(r.get("issue"))
+        if not k:
+            continue
+        p = prev.setdefault(k, [0, 0])
+        p[0] += 1
+        p[1] += HEAT_W.get(r.get("tone") or "", 0)
+    for it in board:
+        p = prev.get(it["key"])
+        if p and p[0] >= max(3, floor // 2):
+            it["trend"] = round(it["heat"] - p[1] / p[0], 2)
+        else:
+            it["trend"] = None
+
+
+def _ai_verdicts(board):
+    """One small call: a one-line editorial verdict per top issue,
+    grounded only in the numbers and quotes supplied. Failures are
+    silent — the board simply ships without verdicts."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    top = board[:HEAT_VERDICTS]
+    if not key or not top:
+        return
+    payload = [{"issue": it["issue"], "contributions": it["n"],
+                "heat": it["heat"], "trend": it.get("trend"),
+                "tones": it["tones"], "stances": it["stances"],
+                "quotes": [r["q"] for r in it["receipts"]][:2]}
+               for it in top]
+    prompt = (
+        "You write one-line verdicts for a parliamentary heat board. "
+        "For each issue below you get its stats from the last 10 sitting "
+        "days of the Commons: contribution count, heat score (0 calm to "
+        "3 furious), trend vs the previous fortnight, tone mix, stance "
+        "mix (relative to the government position), and sample quotes.\n"
+        "Write ONE sentence per issue, under 20 words, in plain "
+        "newspaper English. State only what the supplied numbers and "
+        "quotes support. Never use em dashes. No hype words.\n"
+        "Reply with ONLY a JSON object mapping each issue name exactly "
+        "as given to its sentence. No other text.\n\n"
+        + json.dumps(payload, ensure_ascii=False))
+    try:
+        r = requests.post(ANTHROPIC_URL, timeout=120, headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }, json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1200,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        txt = "".join(b.get("text", "") for b in r.json().get("content", []))
+        txt = txt.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        verdicts = json.loads(txt)
+    except Exception as e:
+        print(f"heat: verdicts skipped ({e})")
+        return
+    for it in board:
+        v = verdicts.get(it["issue"])
+        if isinstance(v, str) and v.strip():
+            it["verdict"] = v.strip().replace("\u2014", ",").replace("\u2013", ",")
+    print(f"heat: verdicts written for {sum(1 for i in board if i.get('verdict'))} issues")
+
+
+
+
+HEAT_AREAS = ["Economy & business", "Health & care", "Defence & security",
+              "Foreign affairs", "Home affairs & justice",
+              "Education & children", "Energy & environment", "Transport",
+              "Housing & communities", "Welfare & pensions",
+              "Devolution & the Union", "Parliament & constitution"]
+
+
+def _map_new_issues_to_areas(unmapped):
+    """One small AI call: file new issue names under the fixed list of
+    policy areas. Returns {} on any failure; unmapped issues simply sit
+    out of the Policy tab until mapped."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not key or not unmapped:
+        return {}
+    prompt = ("File each parliamentary issue name under exactly one of "
+              "these policy areas: " + json.dumps(HEAT_AREAS) + ".\n"
+              "Issues: " + json.dumps(sorted(unmapped), ensure_ascii=False)
+              + "\nReply with ONLY a JSON object mapping each issue name "
+              "exactly as given to one area name exactly as given.")
+    try:
+        r = requests.post(ANTHROPIC_URL, timeout=120, headers={
+            "x-api-key": key, "anthropic-version": "2023-06-01",
+            "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 2000,
+                  "messages": [{"role": "user", "content": prompt}]})
+        txt = "".join(b.get("text", "") for b in r.json().get("content", []))
+        txt = txt.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+        out = json.loads(txt)
+        return {k: v for k, v in out.items() if v in HEAT_AREAS}
+    except Exception as e:
+        print(f"areas: mapping call skipped ({e})")
+        return {}
+
+
+
+def _area_voices(rows, area_of, members):
+    """Three characters per policy area: the workhorse (most vocal),
+    the attacker (hottest when challenging the government, floor of 5
+    challenging contributions), and the chief scrutineer (most asking).
+    """
+    def _is_chair(mid):
+        m = members.get(mid) or {}
+        role = (m.get("role") or "").lower()
+        return (m.get("party") == "Spk" or "speaker" in role
+                or "ways and means" in role)
+
+    agg = {}
+    for r in rows:
+        area = area_of.get(r.get("issue"))
+        mid = str(r.get("mid") or "")
+        if not area or not mid or _is_chair(mid):
+            continue
+        a = agg.setdefault(area, {}).setdefault(
+            mid, {"n": 0, "pts": 0, "ch_n": 0, "ch_pts": 0, "seek": 0})
+        w = HEAT_W.get(r.get("tone") or "", 0)
+        a["n"] += 1
+        a["pts"] += w
+        st = r.get("stance") or ""
+        if st in ("opposing", "pushing further"):
+            a["ch_n"] += 1
+            a["ch_pts"] += w
+        if st == "seeking":
+            a["seek"] += 1
+
+    def who(mid, val, note):
+        m = members.get(mid) or {}
+        return {"who": m.get("name", "an MP"),
+                "party": m.get("party", ""), "v": val, "note": note}
+
+    out = {}
+    for area, mps in agg.items():
+        v = {}
+        vocal = max(mps.items(), key=lambda kv: kv[1]["n"])
+        v["vocal"] = who(vocal[0], f"{vocal[1]['n']} contributions",
+                         f"spoke at {vocal[1]['pts']/vocal[1]['n']:.2f}")
+        attackers = [(mid, a) for mid, a in mps.items() if a["ch_n"] >= 5]
+        if attackers:
+            mid, a = max(attackers, key=lambda kv: kv[1]["ch_pts"]/kv[1]["ch_n"])
+            v["attack"] = who(mid, f"{a['ch_pts']/a['ch_n']:.2f}",
+                              f"across {a['ch_n']} challenging contributions")
+        seekers = [(mid, a) for mid, a in mps.items() if a["seek"] >= 3]
+        if seekers:
+            mid, a = max(seekers, key=lambda kv: kv[1]["seek"])
+            v["seeking"] = who(mid, f"{a['seek']} questions",
+                               "genuinely asking, not attacking")
+        out[area] = v
+    return out
+
+
+def _area_rollup(board, area_of, floor):
+    """Group a window's ranked issues into policy areas. Same score,
+    added up: an area's number is the average across every contribution
+    made on its issues."""
+    agg = {}
+    for it in board:
+        area = area_of.get(it["issue"])
+        if not area:
+            continue
+        a = agg.setdefault(area, {"n": 0, "pts": 0.0, "issues": []})
+        a["n"] += it["n"]
+        a["pts"] += it["heat"] * it["n"]
+        a["issues"].append({"issue": it["issue"], "heat": it["heat"],
+                            "n": it["n"]})
+    out = []
+    for area, a in agg.items():
+        if a["n"] < floor:
+            continue
+        out.append({"area": area, "n": a["n"],
+                    "heat": round(a["pts"] / a["n"], 2),
+                    "top": sorted(a["issues"],
+                                  key=lambda x: (-x["heat"], -x["n"]))[:3]})
+    out.sort(key=lambda x: (-x["heat"], -x["n"]))
+    return out
+
+
+def export_sentiment(members, rows):
+    """Build data/sentiment.json from the permanent store:
+    - per-MP monthly tone trajectory (last 6 months) with a plain
+      rule-based sentence, no AI cost
+    - sentiment league tables: hottest speakers, escalators, calm
+      operators. Floors keep small samples off every table."""
+    if not rows:
+        return
+    months = sorted({r["said_on"][:7] for r in rows if r.get("said_on")})[-12:]
+    if not months:
+        return
+    mstats, counts_by_mid, challenge_by_mid = {}, {}, {}
+    for r in rows:
+        d = r.get("said_on") or ""
+        if d[:7] not in months:
+            continue
+        mid = str(r.get("mid") or "")
+        if not mid:
+            continue
+        s = mstats.setdefault(mid, {m: [0, 0] for m in months})
+        s[d[:7]][0] += 1
+        s[d[:7]][1] += HEAT_W.get(r.get("tone") or "", 0)
+        c = counts_by_mid.setdefault(mid, {"st": {}, "tn": {}})
+        st, tn = r.get("stance") or "", r.get("tone") or ""
+        if st:
+            c["st"][st] = c["st"].get(st, 0) + 1
+        if tn:
+            c["tn"][tn] = c["tn"].get(tn, 0) + 1
+        # attack index raw material: challenging contributions, by month
+        if st in ("opposing", "pushing further"):
+            ch = challenge_by_mid.setdefault(mid, {})
+            mo = ch.setdefault(d[:7], [0, 0])
+            mo[0] += 1
+            mo[1] += HEAT_W.get(tn, 0)
+
+    def sentence(series):
+        """series = [(month, n, heat)] for months with speech."""
+        live = [(m, n, h) for m, n, h in series if n >= 3]
+        if len(live) < 2:
+            return ""
+        recent = [h for _, _, h in live[-2:]]
+        early = [h for _, _, h in live[:-2]] or recent
+        r_avg = sum(recent) / len(recent)
+        e_avg = sum(early) / len(early)
+        mname = {"01": "January", "02": "February", "03": "March",
+                 "04": "April", "05": "May", "06": "June", "07": "July",
+                 "08": "August", "09": "September", "10": "October",
+                 "11": "November", "12": "December"}[live[-2][0][5:7]]
+        if r_avg - e_avg >= 0.25:
+            return f"more heated since {mname}"
+        if e_avg - r_avg >= 0.25:
+            return f"calmer since {mname}"
+        if r_avg >= 0.8:
+            return "consistently heated"
+        if r_avg <= 0.2:
+            return "measured throughout"
+        return "steady"
+
+    mps_out, qual = {}, []
+    q_from = (date.today() - timedelta(days=90)).isoformat()[:7]
+    for mid, s in mstats.items():
+        series = [(m, n, round(p / n, 2) if n else 0)
+                  for m, (n, p) in sorted(s.items())]
+        total = sum(n for _, n, _ in series)
+        if total < 3:
+            continue
+        mps_out[mid] = {"t": [[m[5:], n, h] for m, n, h in series],
+                        "s": sentence(series),
+                        "c": counts_by_mid.get(mid, {})}
+        # quarter stats for the league tables
+        qn = sum(n for m, n, _ in series if m >= q_from)
+        qp = sum(round(h * n) for m, n, h in series if m >= q_from)
+        if qn:
+            qual.append((mid, qn, qp / qn, series))
+
+    def row(mid, val, extra=""):
+        m = members.get(mid) or {}
+        return {"mid": mid, "name": m.get("name", "Unknown MP"),
+                "party": m.get("party", ""), "v": val, "x": extra}
+
+    # attack index: heat across their challenging contributions only,
+    # last quarter, floor of 10 challenging contributions
+    atk = []
+    for mid, ch in challenge_by_mid.items():
+        qn = sum(v[0] for m, v in ch.items() if m >= q_from)
+        qp = sum(v[1] for m, v in ch.items() if m >= q_from)
+        if qn >= 10:
+            atk.append((mid, qn, qp / qn))
+    attack = [row(mid, round(h, 2), f"{n} challenging contributions")
+              for mid, n, h in sorted(atk, key=lambda a: -a[2])[:10]]
+    calm = [row(mid, round(h, 2), f"{n} contributions")
+            for mid, n, h, _ in
+            sorted((q for q in qual if q[1] >= 40),
+                   key=lambda q: q[2])[:10]]
+    esc = []
+    for mid, n, h, series in qual:
+        live = [(m, nn, hh) for m, nn, hh in series if nn >= 5]
+        if len(live) < 3:
+            continue
+        delta = (sum(hh for _, _, hh in live[-2:]) / 2
+                 - sum(hh for _, _, hh in live[:-2]) / len(live[:-2]))
+        esc.append((mid, round(delta, 2), n))
+    escalators = [row(mid, (f"+{d:.2f}" if d > 0 else f"{d:.2f}"),
+                      f"{n} contributions")
+                  for mid, d, n in sorted(esc, key=lambda e: -e[1])[:10]
+                  if d > 0.1]
+
+    MFULL = {"01": "Jan", "02": "Feb", "03": "Mar", "04": "Apr",
+             "05": "May", "06": "Jun", "07": "Jul", "08": "Aug",
+             "09": "Sep", "10": "Oct", "11": "Nov", "12": "Dec"}
+    span = (f"{MFULL[months[0][5:]]} {months[0][:4]} to "
+            f"{MFULL[months[-1][5:]]} {months[-1][:4]}")
+    save("sentiment.json", {
+        "updated": date.today().isoformat(),
+        "span": span,
+        "months": [m[5:] for m in months],
+        "mps": mps_out,
+        "leagues": {"attack": attack, "escalators": escalators,
+                    "calm": calm},
+    })
+    print(f"sentiment: {len(mps_out)} MP trajectories, "
+          f"{len(attack)}/{len(escalators)}/{len(calm)} league rows")
+
+
+def export_heat(members, aliases=None, rows=None):
+    """Build data/heat.json: two ready-made boards (last 10 sitting days
+    and last quarter) with heat, trend, chips data, receipts, verdicts."""
+    if rows is None:
+        rows = fetch_speech_history()
+    if not rows:
+        return
+    # pool splintered names through the card index before ranking
+    if aliases:
+        for r in rows:
+            r["issue"] = aliases.get(r.get("issue"), r.get("issue"))
+    # governing party = the party holding the most government posts
+    tally = {}
+    for m in members.values():
+        if m.get("roleType") == "gov":
+            tally[m.get("party")] = tally.get(m.get("party"), 0) + 1
+    gov_party = max(tally, key=tally.get) if tally else "Lab"
+
+    days = sorted({r["said_on"] for r in rows if r.get("said_on")})
+    fort_days = set(days[-10:])
+    prev_fort_days = set(days[-20:-10])
+    today = date.today()
+    q_from = (today - timedelta(days=90)).isoformat()
+    pq_from = (today - timedelta(days=180)).isoformat()
+
+    fort_rows = [r for r in rows if r.get("said_on") in fort_days]
+    prev_fort_rows = [r for r in rows if r.get("said_on") in prev_fort_days]
+    qtr_rows = [r for r in rows if (r.get("said_on") or "") >= q_from]
+    pq_rows = [r for r in rows
+               if pq_from <= (r.get("said_on") or "") < q_from]
+
+    fort = _window_board(fort_rows, members, gov_party, HEAT_FLOOR_FORT)
+    _attach_trend(fort, prev_fort_rows, members, gov_party, HEAT_FLOOR_FORT)
+    qtr = _window_board(qtr_rows, members, gov_party, HEAT_FLOOR_QTR)
+    _attach_trend(qtr, pq_rows, members, gov_party, HEAT_FLOOR_QTR)
+
+    # policy areas: card index on disk, AI maps anything new, rollup
+    area_of = load("issue_areas.json", {})
+    on_boards = {it["issue"] for it in fort} | {it["issue"] for it in qtr}
+    new_map = _map_new_issues_to_areas(on_boards - set(area_of))
+    if new_map:
+        area_of.update(new_map)
+        save("issue_areas.json", area_of)
+        print(f"areas: mapped {len(new_map)} new issues")
+
+    fort_areas = _area_rollup(fort, area_of, HEAT_FLOOR_FORT)
+    qtr_areas = _area_rollup(qtr, area_of, HEAT_FLOOR_QTR)
+    for areas, wrows in ((fort_areas, fort_rows), (qtr_areas, qtr_rows)):
+        voices = _area_voices(wrows, area_of, members)
+        for a in areas:
+            a["voices"] = voices.get(a["area"], [])
+
+    _ai_verdicts(fort)
+    # quarter rows borrow the verdict where the same issue appears
+    vmap = {it["key"]: it.get("verdict") for it in fort if it.get("verdict")}
+    for it in qtr:
+        if it["key"] in vmap and "verdict" not in it:
+            it["verdict"] = vmap[it["key"]]
+
+    for board in (fort, qtr):
+        for it in board:
+            it.pop("key", None)
+
+    save("heat.json", {
+        "updated": today.isoformat(),
+        "gov_party": gov_party,
+        "fortnight": {"label": "Last 10 sitting days",
+                      "from": min(fort_days) if fort_days else "",
+                      "to": max(fort_days) if fort_days else "",
+                      "floor": HEAT_FLOOR_FORT, "issues": fort,
+                      "areas": fort_areas},
+        "quarter": {"label": "Last quarter",
+                    "from": q_from, "to": days[-1] if days else "",
+                    "floor": HEAT_FLOOR_QTR, "issues": qtr,
+                    "areas": qtr_areas},
+    })
+    print(f"heat: exported {len(fort)} fortnight / {len(qtr)} quarter issues")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["backfill", "nightly"], default="nightly")
@@ -1283,7 +1867,9 @@ def main():
     ai_tag_debates(debates, top_headings, top_depts_for_ai)
     save("debates.json", debates)
 
-    ai_classify_debates(pending, mp_q, members)
+    aliases = fetch_issue_aliases()
+    known_issues = fetch_recent_issue_names(aliases)
+    ai_classify_debates(pending, mp_q, members, known_issues)
     save("pending_class.json", pending)
 
     # sweep out accidental double verdicts (same MP, same day, same
@@ -1341,6 +1927,15 @@ def main():
     # push_to_db removes each entry's debate id only on confirmed
     # success, so failures keep their id and retry on the next run
     push_to_db(mp_q)
+
+    # bake the Heat board and sentiment summaries from the
+    # permanent store: one database read feeds both
+    hist_rows = fetch_speech_history()
+    if aliases:
+        for hr in hist_rows:
+            hr["issue"] = aliases.get(hr.get("issue"), hr.get("issue"))
+    export_heat(members, None, hist_rows)
+    export_sentiment(members, hist_rows)
 
     save("state.json", state)
     save("votes.json", votes)
