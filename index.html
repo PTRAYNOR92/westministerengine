@@ -98,6 +98,25 @@ spark{display:inline-block}
 .receipt b{color:var(--text);font-weight:600;font-style:normal}
 @media(max-width:700px){.hverdict,.receipt{margin-left:0}}
 
+/* bills */
+.bstage{font:600 10px var(--mono);letter-spacing:.06em;text-transform:uppercase;
+  padding:3px 8px;border:1px solid var(--border);color:var(--dim);white-space:nowrap}
+.bstage.act{border-color:var(--cool);color:var(--cool)}
+.brow{border-top:1px solid var(--border);padding:16px 2px;cursor:pointer;transition:background .12s}
+.brow:hover{background:#F8F6F0}
+.bsec{border-top:1px solid var(--border);padding:18px 0 12px;margin-top:8px}
+.jstep{display:flex;gap:12px;align-items:baseline;padding:7px 0;border-top:1px solid var(--border);font-size:13.5px}
+.jdot{width:10px;height:10px;border-radius:50%;flex-shrink:0;align-self:center}
+.jdot.done{background:var(--text)}
+.jdot.current{background:var(--violet);box-shadow:0 0 0 3px color-mix(in srgb,var(--violet) 25%,transparent)}
+.jdot.upcoming{background:transparent;border:1.5px solid var(--faint)}
+.jhouse{font:600 9.5px var(--mono);letter-spacing:.08em;color:var(--faint);text-transform:uppercase;min-width:64px}
+.arung{display:flex;gap:12px;align-items:center;padding:8px 0;border-top:1px solid var(--border);font-size:13.5px;flex-wrap:wrap}
+.abadge{font:600 9.5px var(--mono);letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;min-width:120px;text-align:center}
+.abar{height:7px;background:var(--grad);display:inline-block;vertical-align:middle}
+.ask{border-top:1px solid var(--border);padding:11px 0}
+.moodrow{display:flex;gap:12px;align-items:center;padding:9px 0;border-top:1px solid var(--border);flex-wrap:wrap}
+
 /* welcome */
 .fp-hero{padding:44px 0 26px;text-align:center;border-bottom:none}
 .fp-kick{font:700 11px var(--body);letter-spacing:.16em;text-transform:uppercase;color:var(--violet)}
@@ -165,13 +184,14 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
 
 let DATA = {}, tab = "home", selMP = null, query = "", selDept = "";
 let heatWin = "fortnight", heatBench = "all", heatOpen = -1;
+let selBill = null, billArchive = false;
 
-const TABS = [["home","Welcome"],["heat","Heat board"],["policy","Policy areas"],["mps","MP intelligence"],["leagues","League tables"],["momentum","Momentum"],["about","About"]];
+const TABS = [["home","Welcome"],["heat","Heat board"],["bills","Bills"],["policy","Policy areas"],["mps","MP intelligence"],["leagues","League tables"],["momentum","Momentum"],["about","About"]];
 
 async function boot(){
   const dl = document.querySelector("#dl-date b");
   if(dl) dl.textContent = new Date().toLocaleDateString("en-GB",{weekday:"long", day:"numeric", month:"long", year:"numeric"});
-  const files = ["meta","mps","topics","leagues","heat","sentiment"];
+  const files = ["meta","mps","topics","leagues","heat","sentiment","bills"];
   for (const f of files){
     try { DATA[f] = await (await fetch(`data/${f}.json?v=${Date.now()}`)).json(); }
     catch(e){ DATA[f] = null; }
@@ -453,6 +473,158 @@ function renderHeat(){
     <div class="faint" style="font-size:11px;margin-top:14px;line-height:1.6">
       How the score works, in plain terms: every time an MP speaks on an issue, their contribution is scored 3 if it was angry, 2 if impassioned, 1 if worried, and 0 if it was routine business or friendly. The issue&rsquo;s number is the average, so it runs from 0 (everyone stayed businesslike) to 3 (every single contribution was furious). In practice anything above 1 is a strikingly charged debate. How often an issue comes up is only used as an entry bar: it needs ${W.floor||10} contributions in the window to appear at all (5 when filtering to a single side of the House), so one angry speech cannot top the chart on its own. Built from what MPs say out loud in the Commons Chamber and Westminster Hall; written questions are formal documents with the feeling drafted out, so they are tracked elsewhere on this site but not scored here. The small colour bar on each row shows the mix of what speakers were doing: backing the government, pushing it to go further, opposing, asking questions, or raising local cases. Hover it for the percentages. Rebuilt nightly from the full official record since January 2026. Behind every number sits a verbatim quote in our archive, and you can read each MP&rsquo;s own receipts on their card in MP intelligence.
     </div>
+  </div>`;
+}
+
+
+/* ---------- BILLS ---------- */
+const STAGE_ABBR = [["1st reading","1R"],["2nd reading","2R"],["3rd reading","3R"],
+  ["Committee of the whole House","Cttee"],["Committee stage","Cttee"],["Report stage","Report"],
+  ["Programme motion","Prog"],["Money resolution","Money"],["Ways and Means resolution","W&M"],
+  ["Carry-over motion","C/O"],["Bill reintroduced","Reintro"],["Consideration of Lords amendments","LA"],
+  ["Consideration of Commons amendments","CA"],["Royal Assent","RA"]];
+function stageAbbr(s){ const m = STAGE_ABBR.find(([k])=>s.startsWith(k)); return m ? m[1] : s.split(" ")[0]; }
+
+function billTimeline(b){
+  const tl = b.timeline||[], mk = (b.markers||[]).filter(m=>m.h==="Commons");
+  if(!tl.length) return "";
+  const ds = tl.map(t=>Date.parse(t.d)).concat(mk.map(m=>Date.parse(m.d)));
+  const lo = Math.min(...ds), hi = Math.max(...ds, lo + 864e5);
+  const W=860, H=150, P=14, plotH=92, baseY=118;
+  const X = d => P + (Date.parse(d)-lo)/(hi-lo)*(W-2*P);
+  const lastAct = tl[tl.length-1].d;
+  const lastX = [-99,-99];
+  const marks = mk.map((m,i)=>{
+    const x=X(m.d), fut = m.d > lastAct;
+    // two label rows, and a label is dropped rather than allowed to
+    // collide with its neighbour; the dashed stage line always stays
+    let row = (x - lastX[0] >= 40) ? 0 : (x - lastX[1] >= 40) ? 1 : -1;
+    const ly = row===1 ? 24 : 11;
+    if(row>=0) lastX[row] = x;
+    const line = `<line x1="${x}" y1="${row<0?4:ly+4}" x2="${x}" y2="${baseY}" stroke="var(--faint)" stroke-width="1" stroke-dasharray="3 3" opacity="${fut?0.55:1}"><title>${esc(m.s)} · ${esc(m.d)}</title></line>`;
+    if(row<0) return line;
+    return line + `<text x="${x}" y="${ly}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--${fut?'faint':'dim'})">${esc(stageAbbr(m.s))}${fut?" ·":""}<title>${esc(m.s)} · ${esc(m.d)}</title></text>`;
+  }).join("");
+  const bars = tl.map(t=>{
+    const x=X(t.d), hgt=Math.max(2,(t.heat/3)*plotH);
+    return `<rect x="${x-2}" y="${baseY-hgt}" width="4" height="${hgt}" fill="${t.heat>=1?"var(--hot)":t.heat>=0.5?"var(--warm)":"var(--dim)"}"><title>${esc(t.d)} · ${t.n} contributions · heat ${t.heat.toFixed(2)}</title></rect>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block">
+    <line x1="${P}" y1="${baseY}" x2="${W-P}" y2="${baseY}" stroke="var(--border-b)" stroke-width="1.5"/>
+    ${marks}${bars}
+    <text x="${P}" y="${H-6}" font-family="var(--mono)" font-size="9.5" fill="var(--faint)">${esc(tl[0].d)}</text>
+    <text x="${W-P}" y="${H-6}" text-anchor="end" font-family="var(--mono)" font-size="9.5" fill="var(--faint)">${esc(mk.length&&mk[mk.length-1].d>lastAct?mk[mk.length-1].d+" (listed)":lastAct)}</text>
+  </svg>`;
+}
+
+function renderBills(){
+  const B = DATA.bills;
+  if(!B?.bills?.length) return `<div class="panel"><div class="empty">No bill data yet. The next nightly run will bake it. If this persists, check the engine ran green on GitHub.</div></div>`;
+  const b = B.bills.find(x=>x.id===selBill);
+  if(b) return renderBillDetail(b, B);
+  const shown = B.bills.filter(x=>billArchive ? x.act : !x.act);
+  const nLaw = B.bills.filter(x=>x.act).length;
+  const list = shown.map(x=>`<div class="brow" onclick="selBill=${x.id};render();window.scrollTo({top:0})">
+      <div class="top" style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
+        <span class="hscore" style="color:${heatColor(x.heat)}">${x.heat.toFixed(2)}</span>
+        <span class="hissue">${esc(x.title)}</span>
+        <span class="bstage ${x.act?"act":""}">${x.act?"Passed · now law":esc((x.house?x.house+" · ":"")+(x.stage||"in progress"))}</span>
+        <div class="hmeta">
+          ${toneChips(x.tones)}
+          ${stanceBar(x.stances, x.n)}
+          <span class="faint mono" style="font-size:10px">${x.n} CONTRIBUTIONS</span>
+          <span class="faint mono" style="font-size:10px">LAST HEARD ${esc(x.last)}</span>
+        </div>
+      </div>
+      ${x.verdict?`<div class="hverdict">${esc(x.verdict)}</div>`:""}
+    </div>`).join("");
+  return `<div class="panel">
+    <div class="label">Bills &middot; government legislation, and how the Commons is taking it</div>
+    <p class="dim" style="font-size:12.5px;max-width:760px;margin:4px 0 12px">Government bills still going through Parliament, and those that passed during this session, each with at least ${B.floor} classified contributions in the Chamber, matched against Parliament&rsquo;s official bill list so a debate about household energy bills can never be mistaken for legislation. The score is the bill&rsquo;s average heat: 0 means every contribution was routine, 3 means every one was furious. Click a bill for its full journey: who is behind it and against it, when the temperature moved, and which amendments are gathering names. Private members&rsquo; bills are not covered here. Counts are floors, not totals: a contribution filed under a broader subject may not be attributed to its bill.</p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 2px">
+      <button class="pill ${billArchive?"":"on"}" onclick="billArchive=false;render()">Before Parliament now (${B.bills.length-nLaw})</button>
+      <button class="pill ${billArchive?"on":""}" onclick="billArchive=true;render()">Passed this session (${nLaw})</button>
+    </div>
+    <div class="faint" style="font-size:11.5px;margin-bottom:4px">Updated ${esc(B.updated)} &middot; sorted by most recently debated</div>
+    ${list||`<div class="empty">Nothing here yet.</div>`}
+  </div>`;
+}
+
+function renderBillDetail(b, B){
+  const gp = B.gov_party || "Lab";
+  const mood = (b.mood||[]).map(m=>{
+    const isBench = m.bench.startsWith("Government ");
+    const tag = isBench
+      ? `<span class="pdot" style="color:${pcol(m.party)};border:1px solid ${pcol(m.party)}44;background:${pcol(m.party)}14">${esc(m.bench.replace("Government ","Gov "))}</span>`
+      : pdot(m.bench);
+    return `<div class="moodrow">
+      ${tag}
+      <span class="mono" style="font-size:11px;min-width:82px">${m.n} contribution${m.n===1?"":"s"}</span>
+      <span class="mono" style="font-weight:700;color:${heatColor(m.heat)};min-width:38px">${m.heat.toFixed(2)}</span>
+      ${stanceBar(m.stances, m.n)}
+      ${toneChips(m.tones)}
+    </div>`;}).join("");
+  const receipts = (b.receipts||[]).map(r=>`<div class="receipt" style="margin-left:0">&ldquo;${esc(r.q)}&rdquo; <b>&mdash; ${esc(r.who)}</b> ${pdot(r.party)} <span class="faint mono" style="font-size:10px">${esc(r.d)}</span></div>`).join("");
+  const spine = (b.spine||[]).map(s=>`<div class="jstep">
+      <span class="jdot ${s.status}"></span>
+      <span class="jhouse">${esc(s.house==="Unassigned"?"":s.house)}</span>
+      <span style="font-weight:${s.status==="current"?"700":"400"}">${esc(s.stage)}</span>
+      <span class="faint mono" style="font-size:10.5px;margin-left:auto">${s.dates.length?esc(s.dates.join(" · ")):"not yet listed"}</span>
+    </div>`).join("");
+  const AM = b.amendments||{}, CM = AM.commons||{}, LD = AM.lords||{};
+  const DEC = {agreed:["Agreed to","var(--cool)"],negatived:["Lost on a vote","var(--hot)"],
+    withdrawn:["Withdrawn","var(--warm)"],notmoved:["Not moved","var(--faint)"]};
+  const maxN = Math.max(1,...(AM.asks||[]).map(a=>a.n));
+  const partyMix = p => Object.entries(p||{}).sort((a,c)=>c[1]-a[1]).map(([k,v])=>
+    `<span class="pdot" style="color:${pcol(k)};border:1px solid ${pcol(k)}44;background:${pcol(k)}14">${esc(k)} ${v}</span>`).join("");
+  const asks = (AM.asks||[]).map(a=>`<div class="ask">
+      <div style="display:flex;gap:12px;align-items:baseline;flex-wrap:wrap">
+        <span class="mono" style="font-weight:700;font-size:15px;min-width:52px">${a.n}</span>
+        <span style="flex:1;min-width:240px" title="${esc(a.t)}">${esc(a.ask_ai||a.t)}</span>
+        ${a.dec!=="tabled"&&DEC[a.dec]?`<span class="abadge" style="color:${DEC[a.dec][1]};border:1px solid currentColor">${DEC[a.dec][0]}</span>`:""}
+      </div>
+      <div class="abar" style="width:${Math.max(4,320*a.n/maxN)}px;margin:6px 0 4px"></div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <span class="faint" style="font-size:11.5px">led by ${esc(a.lead)}</span>${a.lp?pdot(a.lp):""}
+        <span class="faint" style="font-size:11.5px">${esc(a.house)} ${esc(a.stage).toLowerCase()}</span>
+        ${partyMix(a.parties)}
+      </div>
+    </div>`).join("");
+  const rebels = (AM.rebels||[]).map(r=>{
+    const own = r.lp===(B.gov_party||"Lab");
+    return `<div class="ask">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <span class="mono" style="font-weight:700;font-size:15px;min-width:34px">${r.gbn}</span>
+        <span class="faint" style="font-size:11.5px;min-width:150px">${own?"signing pressure on their own frontbench":"signing an amendment led by "+esc(r.lp)}</span>
+        <span style="flex:1;min-width:200px" title="${esc(r.t)}">${esc(r.ask_ai||r.t)}</span>
+      </div>
+      <div style="font-size:12.5px;color:var(--dim);margin-top:3px">${esc(r.gb.join(", "))}${r.gbn>r.gb.length?" and "+(r.gbn-r.gb.length)+" more":""}</div>
+    </div>`;}).join("");
+  const decLine = Object.entries(CM.decided||{}).map(([k,v])=>`${v} ${(DEC[k]||[k])[0].toLowerCase()}`).join(", ");
+  return `<div class="panel">
+    <button class="pill" onclick="selBill=null;render();window.scrollTo({top:0})">&larr; All bills</button>
+    <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:14px">
+      <span style="font:800 28px var(--disp)">${esc(b.title)}</span>
+      <span class="bstage ${b.act?"act":""}">${b.act?"Passed · now law":esc((b.house?b.house+" · ":"")+(b.stage||"in progress"))}</span>
+      <span class="hscore" style="color:${heatColor(b.heat)};margin-left:auto">${b.heat.toFixed(2)}</span>
+    </div>
+    <div class="faint mono" style="font-size:10.5px;margin-top:4px">${b.n} CLASSIFIED CONTRIBUTIONS · ${esc(b.first)} TO ${esc(b.last)}</div>
+    ${b.verdict?`<p style="font-size:17px;color:var(--dim);max-width:720px;margin:14px 0 4px">${esc(b.verdict)}</p>`:""}
+    ${receipts?`<div class="bsec"><div class="label">The receipts</div>${receipts}</div>`:""}
+    <div class="bsec"><div class="label">The mood, bench by bench</div>
+      <p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 6px">Government frontbench and backbench are separated deliberately: ministers answer for the bill, so it is the backbench row that shows whether the governing party is at ease. The colour bar shows what speakers were doing; hover it for percentages.</p>
+      ${mood}</div>
+    <div class="bsec"><div class="label">Heat over time</div>
+      <p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 10px">Each bar is one sitting day the bill was debated; height is that day&rsquo;s average heat, from 0 to 3. Dashed lines mark Commons stages; a dotted label to the right of the last bar is a listed future sitting.</p>
+      ${billTimeline(b)}</div>
+    <div class="bsec"><div class="label">The journey so far</div>${spine||`<div class="faint" style="font-size:12.5px">Stage data unavailable from Parliament&rsquo;s Bills API for this bill.</div>`}</div>
+    <div class="bsec"><div class="label">What they are trying to change</div>
+      ${CM.n?`<p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 10px">The ${CM.n} amendment${CM.n===1?"":"s"} tabled in the Commons, read for signatures rather than counts. Most amendments are never moved or voted on, so the number of members who put their name to one is the better measure of what has support. Where Parliament gives an amendment a title, that title is used; where it publishes only a drafting instruction, the ask is summarised in one sentence and the original is on hover.${decLine?" Of those decided: "+decLine+".":""}</p>${asks}`:`<div class="faint" style="font-size:12.5px">No Commons amendments on record for this bill yet.</div>`}
+      ${LD.n?`<div class="faint" style="font-size:11.5px;margin-top:12px">The Lords have tabled ${LD.n} amendments to this bill. The Commons Index does not score speech in the Lords, so their debate is not read here, but Lords amendments return to this House for a decision and that debate is scored above.</div>`:""}
+    </div>
+    ${rebels?`<div class="bsec"><div class="label">Government backbenchers putting their names to amendments</div>
+      <p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 10px">Signatures from the governing party&rsquo;s own backbenches, on amendments their frontbench did not table. Names on paper are not votes, and many of these amendments are never pressed, but this is where pressure becomes visible before a division.</p>${rebels}</div>`:""}
+    <div class="faint" style="font-size:11px;margin-top:14px;line-height:1.6">Built from every classified contribution in Commons debates matched to this bill on Parliament&rsquo;s official record, with stages and amendments from Parliament&rsquo;s Bills API. Public Bill Committee sittings are not yet read by the engine, so a committee stage can show its marker with no scored contributions beneath it. Counts are floors, not totals. Behind every judgment sits a verbatim quote.</div>
   </div>`;
 }
 
@@ -787,6 +959,7 @@ function render(keepFocus){
   const m = document.getElementById("main");
   m.innerHTML = tab==="home" ? renderHome()
               : tab==="heat" ? renderHeat() + NEWS_SLAB
+              : tab==="bills" ? renderBills()
               : tab==="policy" ? renderPolicy()
               : tab==="momentum" ? renderMomentum()
               : tab==="mps" ? renderMPs()
