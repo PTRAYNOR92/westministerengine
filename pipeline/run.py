@@ -24,6 +24,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -1252,6 +1253,874 @@ def push_to_db(mp_q):
 
 
 
+# ---------------------------------------------------------------- bills
+# The Bills tab: government legislation only, matched against the
+# official roster from Parliament's Bills API so phrases like
+# "Energy Bills" (household bills) can never sneak in. Whitespace is
+# normalised and Bill/Act-year tails stripped before matching, which
+# reunites double-space variants and bills renamed on becoming Acts.
+# Entirely self-contained: its own database read, its own API calls,
+# and any failure skips the bake and leaves yesterday's bills.json.
+
+BILLS_API = "https://bills-api.parliament.uk/api/v1"
+BILLS_MEMBERS_BIO = "https://members-api.parliament.uk/api/Members/{}/Biography"
+BILLS_TYPES = (1, 4)      # Government Bill + Hybrid Bill (govt-promoted)
+BILLS_FLOOR = 10          # contributions needed to earn a card
+BILLS_RECEIPTS = 3        # receipt quotes per bill
+BILLS_ASKS = 10           # distinct asks shown as the fault lines
+BILLS_REBELS = 6          # backbench-signature amendments shown
+BILLS_AMEND_PAGE = 100    # API page size; 100 is accepted and faster
+BILLS_AMEND_CAP = 900     # per-stage fetch ceiling, politeness cap
+BILLS_VERDICTS = 14       # bills sent for a one-line verdict
+
+# Hansard names Finance Bills "(No. 2)", "(No. 3)" within a session but
+# the Bills API records each simply as "Finance Act <year>". This maps
+# the Hansard stem onto the API stem; dates then pick the right one.
+BILLS_STEM_ALIASES = {
+    "finance (no. 2)": "finance",
+    "finance (no. 3)": "finance",
+    "finance (no. 4)": "finance",
+}
+
+
+def _bill_stem(title):
+    """Normalise a title to its comparable stem: collapse whitespace,
+    drop [HL]/[Lords] markers, strip a trailing Bill / Act <year>,
+    straighten curly punctuation, lowercase."""
+    t = re.sub(r"\s+", " ", title or "").strip()
+    t = re.sub(r"\s*\[(HL|Lords)\]", "", t, flags=re.I)
+    t = (t.replace("\u2019", "'").replace("\u2013", "-")
+          .replace("\u2014", "-"))
+    t = re.sub(r"\s+(Bill|Act(\s+\d{4})?)$", "", t, flags=re.I)
+    return t.lower()
+
+
+_BILLS_SESSION = requests.Session()
+
+
+def _bills_get(url, params=None):
+    """GET with three tries: the Bills API throws the odd 500 and a
+    polite retry usually clears it."""
+    last = None
+    for attempt in range(3):
+        try:
+            r = _BILLS_SESSION.get(
+                url, params=params or {}, timeout=60,
+                headers={"User-Agent": "CommonsIndex/1.0"})
+            if r.status_code == 200:
+                return r.json()
+            last = f"HTTP {r.status_code}"
+            if r.status_code < 500:
+                break
+        except Exception as e:
+            last = str(e)
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"bills api {last} on {url}")
+
+
+def fetch_bill_roster():
+    """The official list of government and hybrid bills for the current
+    session and the two before it (enough to cover this Parliament).
+    Returns {stem: [bill, ...]} — a stem can hold several bills, e.g.
+    the two Finance Acts of a long session."""
+    first = _bills_get(f"{BILLS_API}/Bills", {
+        "SortOrder": "DateUpdatedDescending", "Take": 20})
+    sessions = {s for b in first.get("items", [])
+                for s in (b.get("includedSessionIds") or [])}
+    cur = max(sessions) if sessions else None
+    if cur is None:
+        raise RuntimeError("bills: could not determine current session")
+    stems = {}
+    for sess in (cur, cur - 1, cur - 2):
+        for btype in BILLS_TYPES:
+            skip = 0
+            while True:
+                d = _bills_get(f"{BILLS_API}/Bills", {
+                    "BillType": btype, "Session": sess,
+                    "Take": 50, "Skip": skip})
+                for b in d.get("items", []):
+                    key = _bill_stem(b.get("shortTitle"))
+                    bucket = stems.setdefault(key, [])
+                    if not any(x["billId"] == b["billId"] for x in bucket):
+                        bucket.append(b)
+                if skip + 50 >= d.get("totalResults", 0):
+                    break
+                skip += 50
+    n = sum(len(v) for v in stems.values())
+    print(f"bills: roster {n} government bills, sessions "
+          f"{cur - 2}-{cur}")
+    return stems
+
+
+def fetch_bill_speech():
+    """Read every classified contribution whose debate title contains
+    'bill', straight from the permanent store. Server-side filter keeps
+    this read small and separate from the main history read."""
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if not url or not key:
+        print("bills: no Supabase credentials — skipping")
+        return []
+    rows, offset = [], 0
+    while True:
+        r = requests.get(
+            f"{url}/rest/v1/speech",
+            params={"select": "said_on,mid,stance,tone,quote,debate",
+                    "debate": "ilike.*bill*",
+                    "order": "said_on.asc",
+                    "limit": 1000, "offset": offset},
+            headers={"apikey": key, "Authorization": f"Bearer {key}"},
+            timeout=60)
+        if r.status_code != 200:
+            raise RuntimeError(f"bills: speech read HTTP {r.status_code}")
+        page = r.json()
+        rows += page
+        if len(page) < 1000:
+            break
+        offset += 1000
+    print(f"bills: {len(rows)} bill-debate contributions read")
+    return rows
+
+
+def _match_bill(debate_title, stems):
+    """Map a Hansard debate title to a roster stem, or None. The title
+    is read up to its first standalone word 'Bill' (so 'Energy Bills'
+    never matches), whitespace-normalised, then aliased."""
+    t = re.sub(r"\s+", " ", debate_title or "").strip()
+    t = (t.replace("\u2019", "'").replace("\u2013", "-")
+          .replace("\u2014", "-"))
+    m = re.match(r"^(.*?)\s+Bill\b", t, flags=re.I)
+    if not m:
+        return None
+    s = re.sub(r"\s*\[(HL|Lords)\]", "", m.group(1), flags=re.I)
+    s = s.lower().strip()
+    s = BILLS_STEM_ALIASES.get(s, s)
+    return s if s in stems else None
+
+
+def fetch_bill_stages(bill_id):
+    """All stages for one bill, each with its sitting dates. An API
+    failure returns [] — that bill ships without spine and markers
+    rather than sinking the bake."""
+    out, skip = [], 0
+    try:
+        while True:
+            d = _bills_get(f"{BILLS_API}/Bills/{bill_id}/Stages",
+                           {"Take": 50, "Skip": skip})
+            out += d.get("items", [])
+            if skip + 50 >= d.get("totalResults", 0):
+                break
+            skip += 50
+    except Exception as e:
+        print(f"bills: stages unavailable for {bill_id} ({e})")
+        return []
+    return out
+
+
+def _pick_bill(cands, stage_cache, dates):
+    """When one stem holds several bills (the two Finance Acts), pick
+    the one whose parliamentary stage dates best bracket the debate
+    dates. Newest bill wins any tie."""
+    if len(cands) == 1:
+        return cands[0]
+    mid = sorted(dates)[len(dates) // 2] if dates else ""
+    best, best_score = None, None
+    for b in sorted(cands, key=lambda x: -x["billId"]):
+        st = stage_cache.setdefault(
+            b["billId"], fetch_bill_stages(b["billId"]))
+        sits = sorted(x["date"][:10] for s in st
+                      for x in (s.get("stageSittings") or []))
+        if not sits:
+            score = 10 ** 6
+        elif sits[0] <= mid <= sits[-1]:
+            score = 0
+        else:
+            lo = abs((date.fromisoformat(mid)
+                      - date.fromisoformat(sits[0])).days)
+            hi = abs((date.fromisoformat(mid)
+                      - date.fromisoformat(sits[-1])).days)
+            score = min(lo, hi)
+        if best_score is None or score < best_score:
+            best, best_score = b, score
+    return best
+
+
+_AM_DECISIONS = {
+    "agreed": "agreed", "negatived": "negatived",
+    "withdrawn": "withdrawn", "notmoved": "notmoved",
+    "nodecision": "tabled",
+}
+
+# The Bills API writes parties out in full; the site speaks in codes.
+BILLS_PARTY_CODES = {
+    "Conservative": "Con", "Labour": "Lab", "Labour (Co-op)": "Lab",
+    "Liberal Democrat": "LD", "Scottish National Party": "SNP",
+    "Democratic Unionist Party": "DUP", "Ulster Unionist Party": "UUP",
+    "Social Democratic & Labour Party": "SDLP",
+    "Green Party": "Green", "Plaid Cymru": "PC",
+    "Sinn F\u00e9in": "SF", "Alliance": "APNI",
+    "Reform UK": "RUK", "Traditional Unionist Voice": "TUV",
+    "Independent": "Ind",
+}
+
+
+
+def _supa(path, method="get", **kw):
+    """One door to Supabase for the bills work. Writes need the master
+    key, which only the nightly job holds."""
+    url = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+    if not url or not key:
+        raise RuntimeError("no Supabase credentials")
+    h = {"apikey": key, "Authorization": f"Bearer {key}",
+         "Content-Type": "application/json"}
+    h.update(kw.pop("headers", {}))
+    r = getattr(requests, method)(f"{url}/rest/v1/{path}",
+                                  headers=h, timeout=60, **kw)
+    if r.status_code >= 300:
+        raise RuntimeError(f"supabase {method} {path} "
+                           f"HTTP {r.status_code}: {r.text[:200]}")
+    return r
+
+
+def _chunk(rows, size=500):
+    for i in range(0, len(rows), size):
+        yield rows[i:i + size]
+
+
+def store_bill_debate(links):
+    """Write down which debate title belongs to which bill, so the
+    match is a recorded decision rather than a nightly guess. Rows are
+    left alone once written; a title that stops matching stays on the
+    shelf for inspection rather than vanishing."""
+    if not links:
+        return
+    rows = [{"debate_title": t, "bill_id": b["billId"],
+             "bill_title": b.get("shortTitle", ""), "confirmed": True}
+            for t, b in links.items()]
+    for c in _chunk(rows):
+        _supa("bill_debate", "post", json=c,
+              headers={"Prefer": "resolution=merge-duplicates"})
+    print(f"bills: {len(rows)} debate titles filed against bills")
+
+
+def store_amendments(bill_id, amend_rows, today):
+    """File amendments, their signatures, and one diary line per
+    amendment per day the signature count changes. The diary is what
+    later shows names arriving on an amendment over a fortnight."""
+    if not amend_rows:
+        return
+    main, sponsors, history = [], [], []
+    for a in amend_rows:
+        main.append({
+            "bill_id": bill_id, "house": a["house"], "dnum": a["dnum"],
+            "ask": a["t"], "lead_name": a["lead"],
+            "lead_party": a["lp"], "names": a["n"],
+            "parties": a["parties"], "decision": a["dec"],
+            "stage": a["stage"], "clause": a["clause"],
+            "last_seen": today,
+        })
+        for mid in a["mids"]:
+            sponsors.append({"bill_id": bill_id, "house": a["house"],
+                             "dnum": a["dnum"], "mid": str(mid)})
+        history.append({"bill_id": bill_id, "house": a["house"],
+                        "dnum": a["dnum"], "seen_on": today,
+                        "names": a["n"]})
+    for c in _chunk(main):
+        _supa("amendment", "post", json=c,
+              headers={"Prefer": "resolution=merge-duplicates"})
+    for c in _chunk(sponsors):
+        _supa("amendment_sponsor", "post", json=c,
+              headers={"Prefer": "resolution=ignore-duplicates"})
+    for c in _chunk(history):
+        _supa("amendment_history", "post", json=c,
+              headers={"Prefer": "resolution=merge-duplicates"})
+
+
+def read_amendments(bill_id, members, gov_party):
+    """Read a bill's amendments back out of the permanent store and
+    shape them for the page. Passed bills are served entirely from here
+    and never troubled the Bills API again."""
+    rows, offset = [], 0
+    while True:
+        r = _supa("amendment", "get", params={
+            "select": "house,dnum,ask,ask_ai,lead_name,lead_party,"
+                      "names,parties,decision,stage,clause",
+            "bill_id": f"eq.{bill_id}",
+            "order": "names.desc", "limit": 1000, "offset": offset})
+        page = r.json()
+        rows += page
+        if len(page) < 1000:
+            break
+        offset += 1000
+    if not rows:
+        return None
+    sp, offset = {}, 0
+    while True:
+        r = _supa("amendment_sponsor", "get", params={
+            "select": "house,dnum,mid", "bill_id": f"eq.{bill_id}",
+            "limit": 1000, "offset": offset})
+        page = r.json()
+        for x in page:
+            sp.setdefault((x["house"], x["dnum"]), []).append(x["mid"])
+        if len(page) < 1000:
+            break
+        offset += 1000
+    out = []
+    for a in rows:
+        gb = []
+        for mid in sp.get((a["house"], a["dnum"]), []):
+            m = members.get(str(mid)) or {}
+            if (a["house"] == "Commons" and m.get("party") == gov_party
+                    and m.get("roleType") != "gov"):
+                gb.append(m.get("name") or "")
+        out.append({"t": a["ask"], "ask_ai": a.get("ask_ai") or "",
+                    "dnum": a["dnum"], "n": a["names"] or 0,
+                    "parties": a["parties"] or {},
+                    "lead": a["lead_name"] or "", "lp": a["lead_party"] or "",
+                    "gb": [x for x in gb if x], "dec": a["decision"],
+                    "house": a["house"], "stage": a["stage"],
+                    "clause": a["clause"]})
+    return _shape_amendments(out, gov_party)
+
+
+def _with_backbench(flat, members, gov_party):
+    """Mark which signatures came from governing-party backbenchers."""
+    out = []
+    for a in flat:
+        gb = []
+        for mid in a.get("mids", []):
+            m = members.get(str(mid)) or {}
+            if (a["house"] == "Commons" and m.get("party") == gov_party
+                    and m.get("roleType") != "gov"):
+                gb.append(m.get("name") or "")
+        out.append({**a, "gb": [x for x in gb if x]})
+    return out
+
+
+def _shape_amendments(all_am, gov_party):
+    """Turn a flat list of amendments into what the page shows: the
+    asks ranked by signatures, and the governing-party backbench
+    signatures that are the early warning of a rebellion."""
+    cm = [a for a in all_am if a["house"] == "Commons"]
+    ld = [a for a in all_am if a["house"] == "Lords"]
+    decided = {}
+    for a in cm:
+        if a["dec"] != "tabled":
+            decided[a["dec"]] = decided.get(a["dec"], 0) + 1
+    best = {}
+    for a in sorted(all_am, key=lambda x: -x["n"]):
+        k = (a["t"] or "").lower()[:60]
+        if k and k not in best:
+            best[k] = a
+    asks = sorted(best.values(), key=lambda a: -a["n"])[:BILLS_ASKS]
+    rebels = sorted(
+        [a for a in cm if a["gb"] and (a["lp"] != gov_party
+                                       or len(a["gb"]) >= 3)],
+        key=lambda a: (a["lp"] == gov_party, -len(a["gb"]),
+                       -a["n"]))[:BILLS_REBELS]
+    return {
+        "commons": {"n": len(cm), "decided": decided},
+        "lords": {"n": len(ld)},
+        "asks": [{k: v for k, v in a.items()
+                  if k not in ("gb", "raw", "mids")} for a in asks],
+        "rebels": [{"t": a["t"], "ask_ai": a.get("ask_ai", ""),
+                    "n": a["n"], "lead": a["lead"],
+                    "lp": a["lp"], "gb": a["gb"][:8],
+                    "gbn": len(a["gb"]), "dec": a["dec"],
+                    "stage": a["stage"]} for a in rebels],
+    }
+
+
+def _clean_ask(a):
+    """The plain-English ask behind an amendment. New clauses carry a
+    title in bold, which is Parliament's own words for what the fight
+    is about. Older-style amendments to existing text have no title, so
+    their instruction is used instead."""
+    txt = " ".join(a.get("summaryText") or [])
+    m = re.search(r"<b>\s*[\u201c\"\']?(.+?)[\u201d\"\']?\s*</b>",
+                  txt, flags=re.S)
+    t = m.group(1) if m else txt
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"\s+", " ", t).strip(" ,.;:\u2014-\u201c\u201d\"\'")
+    return t[:130]
+
+
+def fetch_bill_amendments(bill_id, stages, members, gov_party):
+    """Amendments across both Houses, read for signatures rather than
+    counts. Most amendments are never moved or voted on, so the
+    decision field says little; the number of members who put their
+    name to one, and which benches they sit on, says a great deal.
+
+    The same amendment is relisted with a fresh id when a bill is
+    carried over, so records are pooled on dNum, its number on the
+    marshalled list, which is stable across stages."""
+    AMENDABLE = ("committee", "report", "reintroduced",
+                 "consideration", "amendments")
+    seen = {}
+    for s in stages:
+        house = s.get("house") or ""
+        if house not in ("Commons", "Lords"):
+            continue
+        if not any(k in (s.get("description") or "").lower()
+                   for k in AMENDABLE):
+            continue
+        skip, got = 0, 0
+        while True:
+            try:
+                d = _bills_get(
+                    f"{BILLS_API}/Bills/{bill_id}/Stages/{s['id']}"
+                    f"/Amendments",
+                    {"Take": BILLS_AMEND_PAGE, "Skip": skip})
+            except Exception:
+                break                     # stage has no amendment list
+            items = d.get("items", [])
+            if not items:
+                break
+            for i, a in enumerate(items):
+                sponsors = a.get("sponsors") or []
+                parties, gb = {}, []
+                for sp in sponsors:
+                    mid = str(sp.get("memberId") or "")
+                    m = members.get(mid) or {}
+                    p = m.get("party") or BILLS_PARTY_CODES.get(
+                        sp.get("party", ""), sp.get("party", "") or "?")
+                    parties[p] = parties.get(p, 0) + 1
+                    if (house == "Commons" and p == gov_party
+                            and m.get("roleType") != "gov"):
+                        gb.append(m.get("name") or sp.get("name", ""))
+                lead = next((sp for sp in sponsors if sp.get("isLead")),
+                            sponsors[0] if sponsors else {})
+                lmid = str(lead.get("memberId") or "")
+                lp = (members.get(lmid) or {}).get(
+                    "party") or BILLS_PARTY_CODES.get(
+                    lead.get("party", ""), lead.get("party", ""))
+                dnum = str(a.get("dNum") or a.get("amendmentId")
+                           or f"{s['id']}:{skip+i}")
+                seen[(house, dnum)] = {
+                    "dnum": dnum,
+                    "raw": re.sub(r"\s+", " ", re.sub(
+                        r"<[^>]+>", " ",
+                        " ".join(a.get("summaryText") or [])))[:700],
+                    "mids": [str(sp.get("memberId") or "")
+                             for sp in sponsors if sp.get("memberId")],
+                    "t": _clean_ask(a),
+                    "n": len(sponsors),
+                    "parties": parties,
+                    "lead": lead.get("name", ""),
+                    "lp": lp,
+                    "gb": gb,
+                    "dec": _AM_DECISIONS.get(
+                        str(a.get("decision") or "NoDecision").lower(),
+                        "tabled"),
+                    "house": house,
+                    "stage": s.get("description", ""),
+                    "clause": a.get("clause"),
+                }
+            got += len(items)
+            skip += BILLS_AMEND_PAGE
+            if skip >= d.get("totalResults", 0) or got >= BILLS_AMEND_CAP:
+                break
+
+    return list(seen.values())
+
+
+def _fetch_gov_windows(mids):
+    """Government post date windows for the given member ids, from the
+    Members API biography record: {mid: [(start, end_or_None)]}. Only
+    governing-party members who actually spoke on a bill are looked up.
+    A member missing from the result fell back on the day; bench then
+    uses their current role instead."""
+    import concurrent.futures as _cf
+    dead = []
+
+    def one(mid):
+        if dead:
+            return mid, None      # API unreachable; stop asking
+        try:
+            j = get(BILLS_MEMBERS_BIO.format(mid))
+        except Exception:
+            j = None
+        if not j:
+            dead.append(1)
+            return mid, None
+        posts = ((j.get("value") or {}).get("governmentPosts")) or []
+        wins = []
+        for p in posts:
+            if isinstance(p, dict) and p.get("startDate"):
+                wins.append((str(p["startDate"])[:10],
+                             str(p.get("endDate") or "")[:10] or None))
+        return mid, wins
+
+    out = {}
+    with _cf.ThreadPoolExecutor(max_workers=6) as pool:
+        for mid, wins in pool.map(one, mids):
+            if wins is not None:
+                out[mid] = wins
+    return out
+
+
+
+# An amendment that adds something new to a bill is given a title by
+# Parliament and reads plainly. An amendment that edits wording already
+# in the bill is published only as an instruction to the printer, which
+# tells a reader nothing. Those are the ones worth summarising.
+_TECHNICAL = re.compile(r"^(Clause|Page|Schedule|Line)\s", re.I)
+
+
+def summarise_asks(bill_id, shown):
+    """Give the unreadable amendments one plain sentence each. Every
+    summary is written once and filed next to the amendment, so the
+    same amendment is never paid for twice; only new ones cost
+    anything. Failure leaves the drafting text in place."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    todo = [a for a in shown
+            if _TECHNICAL.match(a.get("t") or "")
+            and not (a.get("ask_ai") or "").strip()
+            and (a.get("raw") or a.get("t"))]
+    if not key or not todo:
+        return
+    payload = [{"id": f'{a["house"]}:{a["dnum"]}',
+                "text": (a.get("raw") or a["t"])[:700]} for a in todo]
+    prompt = (
+        "Below are amendments tabled to a bill in the UK Parliament, as "
+        "published: instructions to insert or remove words at a given "
+        "line of the bill.\n"
+        "For each one write ONE sentence, under 20 words, saying what "
+        "the amendment would do in practice. Start with 'Would'. Plain "
+        "English, no jargon, no legal citation, no em dashes.\n"
+        "State only what the text itself does. Do not say whether it is "
+        "strengthening, weakening, tough or modest, and do not guess at "
+        "motive. If the text is too fragmentary to tell, reply with an "
+        "empty string for that id.\n"
+        "Reply with ONLY a JSON object mapping each id to its sentence. "
+        "No other text.\n\n" + json.dumps(payload, ensure_ascii=False))
+    try:
+        r = requests.post(ANTHROPIC_URL, timeout=180, headers={
+            "x-api-key": key, "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }, json={"model": "claude-sonnet-4-6", "max_tokens": 3000,
+                 "messages": [{"role": "user", "content": prompt}]})
+        txt = "".join(b.get("text", "")
+                      for b in r.json().get("content", []))
+        txt = (txt.strip().removeprefix("```json").removeprefix("```")
+               .removesuffix("```").strip())
+        got = json.loads(txt)
+    except Exception as e:
+        print(f"bills: amendment summaries skipped ({e})")
+        return
+    rows = []
+    for a in todo:
+        s = got.get(f'{a["house"]}:{a["dnum"]}')
+        if isinstance(s, str) and s.strip():
+            a["ask_ai"] = (s.strip().replace("\u2014", ",")
+                           .replace("\u2013", ","))
+            rows.append({"bill_id": bill_id, "house": a["house"],
+                         "dnum": a["dnum"], "ask_ai": a["ask_ai"]})
+    if rows:
+        try:
+            for c in _chunk(rows):
+                _supa("amendment", "post", json=c,
+                      headers={"Prefer": "resolution=merge-duplicates"})
+        except Exception as e:
+            print(f"bills: could not file summaries ({e})")
+    print(f"bills: {len(rows)} amendments summarised for bill {bill_id}")
+
+
+def _ai_bill_verdicts(cards):
+    """One small call: a plain-English verdict per bill, grounded only
+    in the numbers and quotes supplied. Failures are silent — the tab
+    simply ships without verdicts."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    top = cards[:BILLS_VERDICTS]
+    if not key or not top:
+        return
+    payload = [{"bill": c["title"], "stage": c["stage"],
+                "house": c["house"], "contributions": c["n"],
+                "heat": c["heat"], "stances": c["stances"],
+                "tones": c["tones"],
+                "quotes": [r["q"] for r in c["receipts"]][:2]}
+               for c in top]
+    prompt = (
+        "You write one-line verdicts for pages tracking government "
+        "bills through the House of Commons. For each bill below you "
+        "get its current stage, how many classified Commons "
+        "contributions it has drawn, its heat score (0 calm to 3 "
+        "furious), the stance mix relative to the government position, "
+        "the tone mix, and sample quotes.\n"
+        "Write ONE sentence per bill, under 22 words, in plain "
+        "newspaper English, describing how the Commons is receiving "
+        "it. State only what the supplied numbers and quotes support. "
+        "Never use em dashes. No hype words.\n"
+        "Reply with ONLY a JSON object mapping each bill title exactly "
+        "as given to its sentence. No other text.\n\n"
+        + json.dumps(payload, ensure_ascii=False))
+    try:
+        r = requests.post(ANTHROPIC_URL, timeout=120, headers={
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }, json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 1400,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+        txt = "".join(b.get("text", "") for b in r.json().get("content", []))
+        txt = (txt.strip().removeprefix("```json").removeprefix("```")
+               .removesuffix("```").strip())
+        verdicts = json.loads(txt)
+    except Exception as e:
+        print(f"bills: verdicts skipped ({e})")
+        return
+    for c in cards:
+        v = verdicts.get(c["title"])
+        if isinstance(v, str) and v.strip():
+            c["verdict"] = (v.strip().replace("\u2014", ",")
+                            .replace("\u2013", ","))
+    print(f"bills: verdicts written for "
+          f"{sum(1 for c in cards if c.get('verdict'))} bills")
+
+
+def export_bills(members):
+    """Build data/bills.json: one card per government bill with Commons
+    sentiment behind it. Verdict, party mood board (government
+    frontbench and backbench separated), heat timeline with stage
+    markers, journey spine, amendments traction ladder, receipts."""
+    # Amendment lists for bills that have already passed cannot
+    # change, so yesterday's bake is reused and the API spared.
+    old_am = {}
+    try:
+        with open(os.path.join(DATA, "bills.json"), encoding="utf-8") as f:
+            for c in json.load(f).get("bills", []):
+                if c.get("act") and c.get("amendments", {}).get("asks"):
+                    old_am[c["id"]] = c["amendments"]
+    except Exception:
+        pass
+    if old_am:
+        print(f"bills: reusing amendments for {len(old_am)} passed bills")
+
+    stems = fetch_bill_roster()
+    rows = fetch_bill_speech()
+    if not rows:
+        return
+
+    tally = {}
+    for m in members.values():
+        if m.get("roleType") == "gov":
+            tally[m.get("party")] = tally.get(m.get("party"), 0) + 1
+    gov_party = max(tally, key=tally.get) if tally else "Lab"
+
+    grouped, links = {}, {}
+    for r in rows:
+        s = _match_bill(r.get("debate"), stems)
+        if s:
+            grouped.setdefault(s, []).append(r)
+            if r.get("debate") not in links:
+                links[r["debate"]] = max(stems[s],
+                                         key=lambda b: b["billId"])
+    try:
+        store_bill_debate(links)
+    except Exception as e:
+        print(f"bills: could not file debate links ({e})")
+
+    # bench at the time of speaking: government post windows for every
+    # governing-party member who spoke on any bill. Failure falls back
+    # to current roles rather than sinking the bake.
+    gov_mids = sorted({str(r.get("mid")) for g in grouped.values()
+                       for r in g
+                       if (members.get(str(r.get("mid"))) or {}
+                           ).get("party") == gov_party})
+    gov_windows = {}
+    try:
+        gov_windows = _fetch_gov_windows(gov_mids)
+        print(f"bills: post history for {len(gov_windows)} of "
+              f"{len(gov_mids)} governing-party speakers")
+    except Exception as e:
+        print(f"bills: post history unavailable ({e}) — current roles")
+
+    def _was_minister(mid, on_date):
+        wins = gov_windows.get(mid)
+        if wins is None:
+            return (members.get(mid) or {}).get("roleType") == "gov"
+        return any(s <= on_date and (e is None or on_date <= e)
+                   for s, e in wins)
+
+    def _build_card(s, srows):
+        dates = sorted({r["said_on"] for r in srows
+                        if r.get("said_on")})
+        cache = {}
+        bill = _pick_bill(stems[s], cache, dates)
+        stages = cache.get(bill["billId"]) or fetch_bill_stages(
+            bill["billId"])
+
+        today_s = date.today().isoformat()
+
+        # per-day heat timeline
+        by_day = {}
+        for r in srows:
+            d = r.get("said_on") or ""
+            a = by_day.setdefault(d, [0, 0])
+            a[0] += 1
+            a[1] += HEAT_W.get(r.get("tone") or "", 0)
+        timeline = [{"d": d, "n": a[0], "heat": round(a[1] / a[0], 2)}
+                    for d, a in sorted(by_day.items())]
+
+        # journey spine + stage markers, in sitting-date order
+        cur_id = (bill.get("currentStage") or {}).get("id")
+        spine = []
+        for st in stages:
+            sits = sorted(x["date"][:10]
+                          for x in (st.get("stageSittings") or []))
+            if st["id"] == cur_id:
+                status = "current"
+            elif not sits:
+                status = "upcoming"
+            elif sits[-1] < today_s:
+                status = "done"
+            else:
+                status = "upcoming"
+            spine.append({"stage": st.get("description", ""),
+                          "house": st.get("house", ""),
+                          "dates": sits, "status": status,
+                          "sort": (sits[0] if sits else "9999",
+                                   st.get("sortOrder", 99))})
+        spine.sort(key=lambda x: x["sort"])
+        for x in spine:
+            x.pop("sort", None)
+        markers = [{"d": x["dates"][0],
+                    "s": x["stage"], "h": x["house"]}
+                   for x in spine if x["dates"]]
+
+        # party mood board, government split front / back
+        mood = {}
+        tones, stances = {}, {}
+        recs = []
+        for r in srows:
+            tone = r.get("tone") or ""
+            stance = r.get("stance") or ""
+            tones[tone] = tones.get(tone, 0) + 1
+            stances[stance] = stances.get(stance, 0) + 1
+            m = members.get(str(r.get("mid"))) or {}
+            party = m.get("party", "?")
+            if party == gov_party:
+                bench = ("Government frontbench"
+                         if _was_minister(str(r.get("mid")),
+                                          r.get("said_on") or "")
+                         else "Government backbench")
+            else:
+                bench = party
+            a = mood.setdefault(bench, {"party": party, "n": 0,
+                                        "tones": {}, "stances": {},
+                                        "pts": 0})
+            a["n"] += 1
+            a["pts"] += HEAT_W.get(tone, 0)
+            a["tones"][tone] = a["tones"].get(tone, 0) + 1
+            a["stances"][stance] = a["stances"].get(stance, 0) + 1
+            w = HEAT_W.get(tone, 0)
+            if w >= 2 and r.get("quote"):
+                recs.append((w, r.get("said_on") or "", {
+                    "who": m.get("name", "an MP"),
+                    "party": party, "tone": tone,
+                    "d": r.get("said_on") or "",
+                    "q": str(r.get("quote"))[:240]}))
+        mood_rows = []
+        for bench, a in mood.items():
+            mood_rows.append({
+                "bench": bench, "party": a["party"], "n": a["n"],
+                "heat": round(a["pts"] / a["n"], 2),
+                "tones": a["tones"], "stances": a["stances"]})
+        mood_rows.sort(key=lambda x: -x["n"])
+        receipts = [r for _, _, r in
+                    sorted(recs, key=lambda x: (-x[0], x[1]))
+                    ][:BILLS_RECEIPTS]
+
+        # Amendments: live bills are checked against Parliament and the
+        # result filed; passed bills are served from the store, since a
+        # bill that is law cannot gain amendments.
+        am = None
+        try:
+            if bill.get("isAct"):
+                am = read_amendments(bill["billId"], members, gov_party)
+            if am is None:
+                flat = fetch_bill_amendments(bill["billId"], stages,
+                                             members, gov_party)
+                try:
+                    store_amendments(bill["billId"], flat, today_s)
+                except Exception as e:
+                    print(f"bills: could not file amendments for "
+                          f"{bill['billId']} ({e})")
+                am = _shape_amendments(_with_backbench(flat, members,
+                                                       gov_party),
+                                       gov_party)
+                # only amendments the page shows are worth summarising
+                by_key = {(x["house"], x["dnum"]): x for x in flat}
+                shown = [by_key[(a["house"], a["dnum"])]
+                         for a in am["asks"] if (a["house"],
+                                                 a["dnum"]) in by_key]
+                summarise_asks(bill["billId"], shown)
+                for a in am["asks"]:
+                    src_a = by_key.get((a["house"], a["dnum"]))
+                    if src_a and src_a.get("ask_ai"):
+                        a["ask_ai"] = src_a["ask_ai"]
+        except Exception as e:
+            print(f"bills: amendments unavailable for "
+                  f"{bill['billId']} ({e})")
+            am = {"commons": {"n": 0, "decided": {}},
+                  "lords": {"n": 0}, "asks": [], "rebels": []}
+
+        pts = sum(HEAT_W.get(t, 0) * c for t, c in tones.items())
+        cur = bill.get("currentStage") or {}
+        return {
+            "id": bill["billId"],
+            "title": re.sub(r"\s+Act\s+\d{4}$", " Bill",
+                            bill.get("shortTitle", "")),
+            "act": bool(bill.get("isAct")),
+            "stage": cur.get("description", ""),
+            "house": cur.get("house", ""),
+            "n": len(srows),
+            "heat": round(pts / len(srows), 2),
+            "tones": tones, "stances": stances,
+            "first": dates[0] if dates else "",
+            "last": dates[-1] if dates else "",
+            "timeline": timeline, "markers": markers,
+            "spine": spine, "mood": mood_rows,
+            "amendments": am,
+            "receipts": receipts,
+        }
+
+    import concurrent.futures as _cf
+    jobs = [(s, srows) for s, srows in grouped.items()
+            if len(srows) >= BILLS_FLOOR]
+    cards = []
+    with _cf.ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {pool.submit(_build_card, s, srows): s
+                for s, srows in jobs}
+        for f in _cf.as_completed(futs):
+            try:
+                cards.append(f.result())
+                print(f"bills: built {futs[f]}", flush=True)
+            except Exception as e:
+                print(f"bills: skipped one bill ({futs[f]}: {e})")
+
+    # The tab shows bills still going through Parliament. Bills that
+    # have passed stay in the store and stay available behind the
+    # archive switch, so a bill does not vanish the day it becomes law.
+    live = [c for c in cards if not c["act"]]
+    passed = [c for c in cards if c["act"]]
+    live.sort(key=lambda c: (c["last"], c["n"]), reverse=True)
+    passed.sort(key=lambda c: (c["last"], c["n"]), reverse=True)
+    cards = live + passed
+    _ai_bill_verdicts(live)
+    save("bills.json", {
+        "updated": date.today().isoformat(),
+        "gov_party": gov_party,
+        "floor": BILLS_FLOOR,
+        "live": len(live),
+        "bills": cards,
+    })
+    print(f"bills: exported {len(live)} live bills, "
+          f"{len(passed)} passed")
+
 # ------------------------------------------------------------- heat board
 
 # tone weights: the heat formula. Heat is earned, calm scores nothing.
@@ -1936,6 +2805,14 @@ def main():
             hr["issue"] = aliases.get(hr.get("issue"), hr.get("issue"))
     export_heat(members, None, hist_rows)
     export_sentiment(members, hist_rows)
+
+    # bake the Bills tab: government legislation, matched against
+    # Parliament's official bill list. Guarded so that a wobble in the
+    # Bills API can never stop the rest of the nightly run
+    try:
+        export_bills(members)
+    except Exception as e:
+        print(f"bills: export failed, keeping yesterday's file ({e})")
 
     save("state.json", state)
     save("votes.json", votes)
