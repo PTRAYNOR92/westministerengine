@@ -102,6 +102,7 @@ spark{display:inline-block}
 .bstage{font:600 10px var(--mono);letter-spacing:.06em;text-transform:uppercase;
   padding:3px 8px;border:1px solid var(--border);color:var(--dim);white-space:nowrap}
 .bstage.act{border-color:var(--cool);color:var(--cool)}
+.bstage.fell{border-color:var(--faint);color:var(--faint)}
 .brow{border-top:1px solid var(--border);padding:16px 2px;cursor:pointer;transition:background .12s}
 .brow:hover{background:#F8F6F0}
 .bsec{border-top:1px solid var(--border);padding:18px 0 12px;margin-top:8px}
@@ -184,7 +185,7 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
 
 let DATA = {}, tab = "home", selMP = null, query = "", selDept = "";
 let heatWin = "fortnight", heatBench = "all", heatOpen = -1;
-let selBill = null, billArchive = false;
+let selBill = null, billView = "live";
 
 const TABS = [["home","Welcome"],["heat","Heat board"],["bills","Bills"],["policy","Policy areas"],["mps","MP intelligence"],["leagues","League tables"],["momentum","Momentum"],["about","About"]];
 
@@ -522,13 +523,16 @@ function renderBills(){
   if(!B?.bills?.length) return `<div class="panel"><div class="empty">No bill data yet. The next nightly run will bake it. If this persists, check the engine ran green on GitHub.</div></div>`;
   const b = B.bills.find(x=>x.id===selBill);
   if(b) return renderBillDetail(b, B);
-  const shown = B.bills.filter(x=>billArchive ? x.act : !x.act);
-  const nLaw = B.bills.filter(x=>x.act).length;
+  const st = x => x.status || (x.act ? "act" : "live");
+  const shown = B.bills.filter(x=>st(x)===billView);
+  const nLive = B.bills.filter(x=>st(x)==="live").length;
+  const nLaw = B.bills.filter(x=>st(x)==="act").length;
+  const nFell = B.bills.filter(x=>st(x)==="fell").length;
   const list = shown.map(x=>`<div class="brow" onclick="selBill=${x.id};render();window.scrollTo({top:0})">
       <div class="top" style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap">
         <span class="hscore" style="color:${heatColor(x.heat)}">${x.heat.toFixed(2)}</span>
         <span class="hissue">${esc(x.title)}</span>
-        <span class="bstage ${x.act?"act":""}">${x.act?"Passed · now law":esc((x.house?x.house+" · ":"")+(x.stage||"in progress"))}</span>
+        <span class="bstage ${st(x)==="act"?"act":st(x)==="fell"?"fell":""}">${st(x)==="act"?(x.assent?"Became law "+esc(x.assent):"Passed · now law"):st(x)==="fell"?"Fell · reached "+esc(x.house?x.house+" "+x.stage:x.stage||"an earlier stage"):esc((x.house?x.house+" · ":"")+(x.stage||"in progress"))}</span>
         <div class="hmeta">
           ${toneChips(x.tones)}
           ${stanceBar(x.stances, x.n)}
@@ -542,9 +546,15 @@ function renderBills(){
     <div class="label">Bills &middot; government legislation, and how the Commons is taking it</div>
     <p class="dim" style="font-size:12.5px;max-width:760px;margin:4px 0 12px">Government bills still going through Parliament, and those that passed during this session, each with at least ${B.floor} classified contributions in the Chamber, matched against Parliament&rsquo;s official bill list so a debate about household energy bills can never be mistaken for legislation. The score is the bill&rsquo;s average heat: 0 means every contribution was routine, 3 means every one was furious. Click a bill for its full journey: who is behind it and against it, when the temperature moved, and which amendments are gathering names. Private members&rsquo; bills are not covered here. Counts are floors, not totals: a contribution filed under a broader subject may not be attributed to its bill.</p>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 2px">
-      <button class="pill ${billArchive?"":"on"}" onclick="billArchive=false;render()">Before Parliament now (${B.bills.length-nLaw})</button>
-      <button class="pill ${billArchive?"on":""}" onclick="billArchive=true;render()">Passed this session (${nLaw})</button>
+      <button class="pill ${billView==="live"?"on":""}" onclick="billView='live';render()">Before Parliament now (${nLive})</button>
+      <button class="pill ${billView==="act"?"on":""}" onclick="billView='act';render()">Became law (${nLaw})</button>
+      ${nFell?`<button class="pill ${billView==="fell"?"on":""}" onclick="billView='fell';render()">Fell when the session ended (${nFell})</button>`:""}
     </div>
+    ${billView==="act"?`<div class="faint" style="font-size:11.5px;margin:10px 0 0;line-height:1.7;border-top:1px solid var(--border);padding-top:10px">Government bills that received Royal Assent while the Index was listening. The record begins in January 2026, so a bill that became law before then is not here however long it was debated. These span more than one parliamentary session.</div>`:""}
+    ${billView==="fell"?`<div class="faint" style="font-size:11.5px;margin:10px 0 0;line-height:1.7;border-top:1px solid var(--border);padding-top:10px">Bills that did not finish before a session ended. They never became law and were never voted down; they ran out of time. A government may reintroduce a fallen bill in a later session.</div>`:""}
+    ${(billView==="live" && B.undebated?.length)?`<div class="faint" style="font-size:11.5px;margin:10px 0 0;line-height:1.7;border-top:1px solid var(--border);padding-top:10px">
+      ${B.undebated.length} further government bill${B.undebated.length===1?" is":"s are"} before Parliament but ${B.undebated.length===1?"has":"have"} not yet been debated in the Commons, so ${B.undebated.length===1?"it has":"they have"} nothing to measure here:
+      ${B.undebated.map(u=>`<span style="white-space:nowrap">${esc(u.title)} <span class="mono" style="font-size:10px;color:var(--faint)">${esc(u.house)} ${esc(u.stage).toLowerCase()}</span></span>`).join(" &middot; ")}</div>`:""}
     <div class="faint" style="font-size:11.5px;margin-bottom:4px">Updated ${esc(B.updated)} &middot; sorted by most recently debated</div>
     ${list||`<div class="empty">Nothing here yet.</div>`}
   </div>`;
@@ -600,15 +610,26 @@ function renderBillDetail(b, B){
       </div>
       <div style="font-size:12.5px;color:var(--dim);margin-top:3px">${esc(r.gb.join(", "))}${r.gbn>r.gb.length?" and "+(r.gbn-r.gb.length)+" more":""}</div>
     </div>`;}).join("");
+  const changes = (AM.changes||[]).map(c=>`<div class="ask">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <span class="abadge" style="color:var(--cool);border:1px solid currentColor">Agreed to</span>
+        <span style="flex:1;min-width:240px" title="${esc(c.t)}">${esc(c.ask_ai||c.t)}</span>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:3px">
+        <span class="faint" style="font-size:11.5px">tabled by ${esc(c.lead)}</span>${c.lp?pdot(c.lp):""}
+        <span class="faint" style="font-size:11.5px">${c.clause!=null?"clause "+c.clause+" · ":""}${esc(c.stage).toLowerCase()}</span>
+      </div>
+    </div>`).join("");
   const decLine = Object.entries(CM.decided||{}).map(([k,v])=>`${v} ${(DEC[k]||[k])[0].toLowerCase()}`).join(", ");
   return `<div class="panel">
     <button class="pill" onclick="selBill=null;render();window.scrollTo({top:0})">&larr; All bills</button>
     <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:14px">
       <span style="font:800 28px var(--disp)">${esc(b.title)}</span>
-      <span class="bstage ${b.act?"act":""}">${b.act?"Passed · now law":esc((b.house?b.house+" · ":"")+(b.stage||"in progress"))}</span>
+      <span class="bstage ${(b.status||(b.act?"act":"live"))==="act"?"act":(b.status==="fell")?"fell":""}">${b.act?(b.assent?"Became law "+esc(b.assent):"Passed · now law"):b.status==="fell"?"Fell when the session ended":esc((b.house?b.house+" · ":"")+(b.stage||"in progress"))}</span>
       <span class="hscore" style="color:${heatColor(b.heat)};margin-left:auto">${b.heat.toFixed(2)}</span>
     </div>
     <div class="faint mono" style="font-size:10.5px;margin-top:4px">${b.n} CLASSIFIED CONTRIBUTIONS · ${esc(b.first)} TO ${esc(b.last)}</div>
+    ${b.status==="fell"?`<p class="dim" style="font-size:13px;max-width:720px;margin:10px 0 0">This bill did not complete its passage before the session ended, so it fell. It never became law and was never voted down; it simply ran out of time. It reached ${esc((b.house?b.house+" ":"")+(b.stage||"an earlier stage").toLowerCase())}. A government may reintroduce a fallen bill in a later session.</p>`:""}
     ${b.verdict?`<p style="font-size:17px;color:var(--dim);max-width:720px;margin:14px 0 4px">${esc(b.verdict)}</p>`:""}
     ${receipts?`<div class="bsec"><div class="label">The receipts</div>${receipts}</div>`:""}
     <div class="bsec"><div class="label">The mood, bench by bench</div>
@@ -622,6 +643,8 @@ function renderBillDetail(b, B){
       ${CM.n?`<p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 10px">The ${CM.n} amendment${CM.n===1?"":"s"} tabled in the Commons, read for signatures rather than counts. Most amendments are never moved or voted on, so the number of members who put their name to one is the better measure of what has support. Where Parliament gives an amendment a title, that title is used; where it publishes only a drafting instruction, the ask is summarised in one sentence and the original is on hover.${decLine?" Of those decided: "+decLine+".":""}</p>${asks}`:`<div class="faint" style="font-size:12.5px">No Commons amendments on record for this bill yet.</div>`}
       ${LD.n?`<div class="faint" style="font-size:11.5px;margin-top:12px">The Lords have tabled ${LD.n} amendments to this bill. The Commons Index does not score speech in the Lords, so their debate is not read here, but Lords amendments return to this House for a decision and that debate is scored above.</div>`:""}
     </div>
+    ${changes?`<div class="bsec"><div class="label">What has actually changed the bill</div>
+      <p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 10px">The amendments agreed to, which are the ones that altered the text of the bill. ${CM.agreed_n} have been agreed in the Commons${CM.agreed_gov===CM.agreed_n?", every one of them tabled by the government":CM.agreed_gov?`, ${CM.agreed_gov} of them tabled by the government`:""}. They carry few signatures because a minister does not need to gather names, which is why they do not appear in the list above.</p>${changes}</div>`:""}
     ${rebels?`<div class="bsec"><div class="label">Government backbenchers putting their names to amendments</div>
       <p class="dim" style="font-size:12px;max-width:720px;margin:2px 0 10px">Signatures from the governing party&rsquo;s own backbenches, on amendments their frontbench did not table. Names on paper are not votes, and many of these amendments are never pressed, but this is where pressure becomes visible before a division.</p>${rebels}</div>`:""}
     <div class="faint" style="font-size:11px;margin-top:14px;line-height:1.6">Built from every classified contribution in Commons debates matched to this bill on Parliament&rsquo;s official record, with stages and amendments from Parliament&rsquo;s Bills API. Public Bill Committee sittings are not yet read by the engine, so a committee stage can show its marker with no scored contributions beneath it. Counts are floors, not totals. Behind every judgment sits a verbatim quote.</div>
