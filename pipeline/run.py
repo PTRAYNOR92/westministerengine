@@ -1269,6 +1269,7 @@ BILLS_FLOOR = 10          # contributions needed to earn a card
 BILLS_RECEIPTS = 3        # receipt quotes per bill
 BILLS_ASKS = 10           # distinct asks shown as the fault lines
 BILLS_REBELS = 6          # backbench-signature amendments shown
+BILLS_CHANGES = 8         # agreed amendments shown as actual changes
 BILLS_AMEND_PAGE = 100    # API page size; 100 is accepted and faster
 BILLS_AMEND_CAP = 900     # per-stage fetch ceiling, politeness cap
 BILLS_VERDICTS = 14       # bills sent for a one-line verdict
@@ -1574,8 +1575,10 @@ def read_amendments(bill_id, members, gov_party):
             if (a["house"] == "Commons" and m.get("party") == gov_party
                     and m.get("roleType") != "gov"):
                 gb.append(m.get("name") or "")
+        lead_gov = False
         out.append({"t": a["ask"], "ask_ai": a.get("ask_ai") or "",
-                    "dnum": a["dnum"], "n": a["names"] or 0,
+                    "dnum": a["dnum"], "lead_gov": lead_gov,
+                    "n": a["names"] or 0,
                     "parties": a["parties"] or {},
                     "lead": a["lead_name"] or "", "lp": a["lead_party"] or "",
                     "gb": [x for x in gb if x], "dec": a["decision"],
@@ -1594,7 +1597,12 @@ def _with_backbench(flat, members, gov_party):
             if (a["house"] == "Commons" and m.get("party") == gov_party
                     and m.get("roleType") != "gov"):
                 gb.append(m.get("name") or "")
-        out.append({**a, "gb": [x for x in gb if x]})
+        lead_gov = False
+        for mid in a.get("mids", [])[:1]:
+            lead_gov = (members.get(str(mid)) or {}).get(
+                "roleType") == "gov"
+        out.append({**a, "gb": [x for x in gb if x],
+                    "lead_gov": lead_gov})
     return out
 
 
@@ -1619,8 +1627,23 @@ def _shape_amendments(all_am, gov_party):
                                        or len(a["gb"]) >= 3)],
         key=lambda a: (a["lp"] == gov_party, -len(a["gb"]),
                        -a["n"]))[:BILLS_REBELS]
+    # Amendments that were agreed to are the ones that actually
+    # changed the bill. They rarely carry many names, because they are
+    # usually tabled by the minister, so they never surface in a list
+    # ranked by signatures and need their own section.
+    agreed = [a for a in cm if a["dec"] == "agreed"]
+    gov_led = sum(1 for a in agreed
+                  if a.get("lead_gov") or a["lp"] == gov_party)
+    changes = sorted(agreed, key=lambda a: (-a["n"],
+                                            a.get("clause") or 999))
     return {
-        "commons": {"n": len(cm), "decided": decided},
+        "commons": {"n": len(cm), "decided": decided,
+                    "agreed_n": len(agreed), "agreed_gov": gov_led},
+        "changes": [{"t": a["t"], "ask_ai": a.get("ask_ai", ""),
+                     "dnum": a["dnum"], "house": a["house"],
+                     "n": a["n"], "lead": a["lead"], "lp": a["lp"],
+                     "stage": a["stage"], "clause": a.get("clause")}
+                    for a in changes[:BILLS_CHANGES]],
         "lords": {"n": len(ld)},
         "asks": [{k: v for k, v in a.items()
                   if k not in ("gb", "raw", "mids")} for a in asks],
@@ -1643,7 +1666,7 @@ def _clean_ask(a):
     t = m.group(1) if m else txt
     t = re.sub(r"<[^>]+>", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" ,.;:\u2014-\u201c\u201d\"\'")
-    return t[:130]
+    return t[:300]
 
 
 def fetch_bill_amendments(bill_id, stages, members, gov_party):
@@ -1945,6 +1968,15 @@ def export_bills(members):
         return any(s <= on_date and (e is None or on_date <= e)
                    for s, e in wins)
 
+    # which session Parliament is currently in, used to tell a live
+    # bill from one that fell when the last session ended
+    cur_session = 0
+    try:
+        cur_session = max(s for bucket in stems.values() for b in bucket
+                          for s in (b.get("includedSessionIds") or []))
+    except Exception:
+        pass
+
     def _build_card(s, srows):
         dates = sorted({r["said_on"] for r in srows
                         if r.get("said_on")})
@@ -2055,10 +2087,10 @@ def export_bills(members):
                 # only amendments the page shows are worth summarising
                 by_key = {(x["house"], x["dnum"]): x for x in flat}
                 shown = [by_key[(a["house"], a["dnum"])]
-                         for a in am["asks"] if (a["house"],
-                                                 a["dnum"]) in by_key]
+                         for a in am["asks"] + am.get("changes", [])
+                         if (a["house"], a["dnum"]) in by_key]
                 summarise_asks(bill["billId"], shown)
-                for a in am["asks"]:
+                for a in am["asks"] + am.get("changes", []):
                     src_a = by_key.get((a["house"], a["dnum"]))
                     if src_a and src_a.get("ask_ai"):
                         a["ask_ai"] = src_a["ask_ai"]
@@ -2070,8 +2102,34 @@ def export_bills(members):
 
         pts = sum(HEAT_W.get(t, 0) * c for t, c in tones.items())
         cur = bill.get("currentStage") or {}
+
+        # Three states, not two. A bill that never passed and was never
+        # voted down has not necessarily survived: if it did not finish
+        # before the session ended, it fell.
+        sessions = bill.get("includedSessionIds") or []
+        if bill.get("isAct"):
+            status = "act"
+        elif bill.get("isDefeated"):
+            status = "fell"
+        elif cur_session and cur_session in sessions:
+            status = "live"
+        else:
+            status = "fell"
+
+        assent = ""
+        if status == "act":
+            for st in stages:
+                if "Royal Assent" in (st.get("description") or ""):
+                    sits = sorted(x["date"][:10]
+                                  for x in (st.get("stageSittings") or []))
+                    if sits:
+                        assent = sits[0]
+                    break
+
         return {
             "id": bill["billId"],
+            "status": status,
+            "assent": assent,
             "title": re.sub(r"\s+Act\s+\d{4}$", " Bill",
                             bill.get("shortTitle", "")),
             "act": bool(bill.get("isAct")),
@@ -2102,24 +2160,53 @@ def export_bills(members):
             except Exception as e:
                 print(f"bills: skipped one bill ({futs[f]}: {e})")
 
+    # Government bills before Parliament that the Commons has not yet
+    # debated. They are named rather than left out silently, so the tab
+    # accounts for every live bill on Parliament's own list and the
+    # reader can see exactly where the boundary sits.
+    matched_ids = set()
+    for s in grouped:
+        matched_ids.add(max(stems[s], key=lambda b: b["billId"])["billId"])
+    undebated = []
+    try:
+        cur = cur_session
+        for bucket in stems.values():
+            for b in bucket:
+                if (b["billId"] in matched_ids or b.get("isAct")
+                        or b.get("isDefeated")
+                        or cur not in (b.get("includedSessionIds") or [])):
+                    continue
+                cs = b.get("currentStage") or {}
+                undebated.append({
+                    "title": b.get("shortTitle", ""),
+                    "house": cs.get("house", ""),
+                    "stage": cs.get("description", "")})
+        undebated.sort(key=lambda x: x["title"])
+    except Exception as e:
+        print(f"bills: undebated list skipped ({e})")
+
     # The tab shows bills still going through Parliament. Bills that
     # have passed stay in the store and stay available behind the
     # archive switch, so a bill does not vanish the day it becomes law.
-    live = [c for c in cards if not c["act"]]
-    passed = [c for c in cards if c["act"]]
-    live.sort(key=lambda c: (c["last"], c["n"]), reverse=True)
-    passed.sort(key=lambda c: (c["last"], c["n"]), reverse=True)
-    cards = live + passed
+    live = [c for c in cards if c["status"] == "live"]
+    passed = [c for c in cards if c["status"] == "act"]
+    fell = [c for c in cards if c["status"] == "fell"]
+    for group in (live, passed, fell):
+        group.sort(key=lambda c: (c["last"], c["n"]), reverse=True)
+    cards = live + passed + fell
     _ai_bill_verdicts(live)
     save("bills.json", {
         "updated": date.today().isoformat(),
         "gov_party": gov_party,
         "floor": BILLS_FLOOR,
         "live": len(live),
+        "fell": len(fell),
+        "undebated": undebated,
         "bills": cards,
     })
-    print(f"bills: exported {len(live)} live bills, "
-          f"{len(passed)} passed")
+    print(f"bills: exported {len(live)} live, {len(passed)} passed, "
+          f"{len(fell)} fell, {len(undebated)} live but not yet "
+          f"debated in the Commons")
 
 # ------------------------------------------------------------- heat board
 
@@ -2806,9 +2893,8 @@ def main():
     export_heat(members, None, hist_rows)
     export_sentiment(members, hist_rows)
 
-    # bake the Bills tab: government legislation, matched against
-    # Parliament's official bill list. Guarded so that a wobble in the
-    # Bills API can never stop the rest of the nightly run
+    # bake the Bills tab, guarded so a wobble in Parliament's Bills API
+    # can never stop the rest of the nightly run
     try:
         export_bills(members)
     except Exception as e:
