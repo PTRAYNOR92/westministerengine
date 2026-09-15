@@ -36,6 +36,8 @@ START_OF_PARLIAMENT = "2024-07-04"
 THEME_WINDOW_DAYS = 183   # "what they're pursuing" looks at the last ~6 months
 THEME_KEEP = 30           # max question texts kept per MP
 THEME_BATCH_CAP = 200     # max MP summaries regenerated per night
+THEME_REFRESH_DAYS = 30   # an MP's summary is rewritten at most once a month,
+                          # and only when there is new material (cost guard)
 DATA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 UA = {"User-Agent": "westminster-engine/1.0 (open data project)"}
 
@@ -58,6 +60,7 @@ CLASS_CTX_CHARS = 350        # context-only items need just enough text to
                              # resolve references, not the whole speech
 CLASS_CHUNK = 25             # contributions per API call
 CLASS_CHUNK_CAP = 300        # max chunks classified per night (cost guard)
+CLASS_SPLIT = 5              # failed chunks are retried once in batches this size
 CLASS_PENDING_MAX_DAYS = 14  # unclassified material older than this degrades
                              # to a plain snippet so nothing is ever lost
 CLASS_KEEP = 50              # classified extracts kept per MP (was 12 snippets)
@@ -437,6 +440,8 @@ def ai_mp_themes(mps_out, mp_q):
     """
     cache = load("mp_glosses.json", {})
     cutoff = (date.today() - timedelta(days=THEME_WINDOW_DAYS)).isoformat()
+    refresh_floor = (date.today()
+                     - timedelta(days=THEME_REFRESH_DAYS)).isoformat()
 
     todo = []
     for m in mps_out:
@@ -452,7 +457,8 @@ def ai_mp_themes(mps_out, mp_q):
         sig = hashlib.md5("|".join(e["t"] for e in ex + dx)
                           .encode("utf-8")).hexdigest()[:12]
         c = cache.get(mid)
-        if c and c.get("sig") == sig and c.get("themes"):
+        recent = bool(c and c.get("made", "") >= refresh_floor)
+        if c and c.get("themes") and (c.get("sig") == sig or recent):
             m["themes"], m["approach"] = c["themes"], c.get("approach", {})
             m["themeN"] = c.get("n", len(ex))
         else:
@@ -465,6 +471,9 @@ def ai_mp_themes(mps_out, mp_q):
     if not todo:
         print("MP themes: all up to date from cache")
         return
+    # MPs with no summary yet go first, then the stalest
+    todo.sort(key=lambda t: (str(t[0]["id"]) in cache,
+                             cache.get(str(t[0]["id"]), {}).get("made", "")))
     todo = todo[:THEME_BATCH_CAP]
     print(f"MP themes: generating for {len(todo)} MPs…")
 
@@ -766,6 +775,41 @@ def ai_tag_debates(debates, headings, depts):
 
 # ---------------------------------------------------------------- compute
 # ------------------------------------------------- speech classification
+def _parse_verdicts(text):
+    """Read the classifier's JSON reply. Tolerates fences, chatter
+    before or after the array, and a broken item mid-list: every
+    well-formed verdict is kept. Returns {index: verdict}."""
+    t = (text or "").strip()
+    t = t.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    items = None
+    a, b = t.find("["), t.rfind("]")
+    if a != -1 and b > a:
+        try:
+            items = json.loads(t[a:b + 1])
+        except Exception:
+            items = None
+    if items is None:  # salvage object by object
+        items, dec, k = [], json.JSONDecoder(), 0
+        while True:
+            k = t.find("{", k)
+            if k == -1:
+                break
+            try:
+                obj, end = dec.raw_decode(t, k)
+                items.append(obj)
+                k = end
+            except Exception:
+                k += 1
+    out = {}
+    for g in items if isinstance(items, list) else []:
+        if isinstance(g, dict) and g.get("i") is not None:
+            try:
+                out[int(g["i"])] = g
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 def ai_classify_debates(pending, mp_q, members, known_issues=None):
     """Read every new contribution IN FULL, in the context of its whole
     debate, and store a small verdict on the speaking MP: issue, stance,
@@ -859,11 +903,11 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
         '{"i": <index>, "issue": "...", "stance": "...", "tone": "...", '
         '"sum": "...", "q": "..."}.\n\n')
 
-    done_ids, classified = set(), 0
-    for deb, ctx, s, e in chunks:
+    def ask(deb, ctx, s, e):
+        """One classification call for items s..e-1 (with context from
+        ctx). Returns {index: verdict} or None if nothing usable came
+        back. Rescues every well-formed verdict from a messy reply."""
         its = deb["items"]
-        if all(its[j].get("done") for j in range(s, e)):
-            continue  # this span was fully marked on an earlier run
         contribs = []
         for j in range(ctx, e):
             live = j >= s and not its[j].get("done")
@@ -885,20 +929,26 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
                               rules + json.dumps(payload,
                                                  ensure_ascii=False)}],
             })
-            if r.status_code != 200:
-                print(f"Classify: HTTP {r.status_code} — "
-                      f"{(r.text or '')[:140]}")
-                continue
-            text = "".join(b.get("text", "")
-                           for b in r.json().get("content", [])
-                           if b.get("type") == "text")
-            text = text.strip().removeprefix("```json") \
-                       .removeprefix("```").removesuffix("```").strip()
-            results = {int(g["i"]): g for g in json.loads(text)
-                       if isinstance(g, dict) and g.get("i") is not None}
         except Exception as exc:
-            print(f"Classify: chunk failed ({exc}) — will retry")
-            continue
+            print(f"Classify: call failed ({exc})")
+            return None
+        if r.status_code != 200:
+            print(f"Classify: HTTP {r.status_code} — {(r.text or '')[:140]}")
+            return None
+        body = r.json()
+        text = "".join(b.get("text", "") for b in body.get("content", [])
+                       if b.get("type") == "text")
+        results = _parse_verdicts(text)
+        if not results:
+            print(f"Classify: unreadable reply for {deb['title'][:40]} "
+                  f"items {s}-{e - 1} (stop: {body.get('stop_reason')}): "
+                  f"{text[:200]!r}")
+            return None
+        return results
+
+    def apply(deb, s, e, results):
+        nonlocal classified
+        its = deb["items"]
         for j in range(s, e):
             it = its[j]
             if it.get("done"):
@@ -923,8 +973,32 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
                 "ext": deb["ext"], "dt": deb["title"]})
             it["done"] = True
             classified += 1
+
+    done_ids, classified, rescued = set(), 0, 0
+    for deb, ctx, s, e in chunks:
+        its = deb["items"]
+        if all(its[j].get("done") for j in range(s, e)):
+            continue  # this span was fully marked on an earlier run
+        results = ask(deb, ctx, s, e)
+        if results:
+            apply(deb, s, e, results)
+        # anything still unmarked in a big span: retry once, five at a
+        # time, so one awkward speech can't sink twenty-four others
+        left = [j for j in range(s, e) if not its[j].get("done")]
+        if len(left) > CLASS_SPLIT:
+            for s2 in range(s, e, CLASS_SPLIT):
+                e2 = min(e, s2 + CLASS_SPLIT)
+                if all(its[j].get("done") for j in range(s2, e2)):
+                    continue
+                before = classified
+                res2 = ask(deb, max(0, s2 - 2), s2, e2)
+                if res2:
+                    apply(deb, s2, e2, res2)
+                    rescued += classified - before
         if all(i.get("done") for i in its):
             done_ids.add(deb["ext"])
+    if rescued:
+        print(f"Classify: {rescued} contributions rescued by small-batch retry")
     # keep only debates with unclassified items; drop finished ones,
     # and inside partially-done debates keep everything (context matters)
     pending[:] = [d for d in pending if d["ext"] not in done_ids]
