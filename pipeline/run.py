@@ -61,6 +61,11 @@ CLASS_CTX_CHARS = 350        # context-only items need just enough text to
 CLASS_CHUNK = 25             # contributions per API call
 CLASS_CHUNK_CAP = 300        # max chunks classified per night (cost guard)
 CLASS_SPLIT = 5              # failed chunks are retried once in batches this size
+BATCH_WAIT_MIN = 100         # how long the nightly waits for the batch to
+                             # finish before parking it for tomorrow night
+BATCH_POLL_SEC = 60          # gap between status checks while waiting
+BATCH_COLLECT_MIN = 25       # patience when collecting yesterday's parked batch
+BATCH_MAX_REQ = 2000         # requests per batch (well inside the 100k limit)
 CLASS_PENDING_MAX_DAYS = 14  # unclassified material older than this degrades
                              # to a plain snippet so nothing is ever lost
 CLASS_KEEP = 50              # classified extracts kept per MP (was 12 snippets)
@@ -350,6 +355,19 @@ def fetch_questions(state, q_monthly, mp_q, mode):
 # ---------------------------------------------------------------- ai gloss
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
+# Two models, chosen by the job.
+# READ is the one that does the judging: reading every contribution and
+# deciding stance, tone, issue and receipt. That is the product, so it
+# stays on Sonnet and every row in the database is marked by the same
+# model, start to finish.
+# SORT is for the mechanical filing jobs — putting a debate under an
+# existing label, filing an issue name under a policy area, writing a
+# one-line gloss on a question heading. These have right answers rather
+# than judgments, none of them writes to the speech table, and Haiku
+# does them at about a third of the price.
+MODEL_READ = "claude-sonnet-4-6"
+MODEL_SORT = "claude-haiku-4-5-20251001"
+
 
 def ai_glosses(topics_out, q_monthly):
     """One plain-English line per trending subject, written by Claude.
@@ -405,7 +423,7 @@ def ai_glosses(topics_out, q_monthly):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }, json={
-            "model": "claude-sonnet-4-6",
+            "model": MODEL_SORT,
             "max_tokens": 4000,
             "messages": [{"role": "user", "content": prompt}],
         })
@@ -517,7 +535,7 @@ def ai_mp_themes(mps_out, mp_q):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             }, json={
-                "model": "claude-sonnet-4-6",
+                "model": MODEL_READ,
                 "max_tokens": 8000,
                 "messages": [{"role": "user", "content": prompt}],
             })
@@ -748,7 +766,7 @@ def ai_tag_debates(debates, headings, depts):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             }, json={
-                "model": "claude-sonnet-4-6",
+                "model": MODEL_SORT,
                 "max_tokens": 8000,
                 "messages": [{"role": "user", "content": prompt}],
             })
@@ -775,6 +793,176 @@ def ai_tag_debates(debates, headings, depts):
 
 # ---------------------------------------------------------------- compute
 # ------------------------------------------------- speech classification
+# ---------------------------------------------------------- spend meter
+# Every Anthropic reply reports the tokens it used. We add them up and
+# print a costed summary at the end of the run, so the real bill is on
+# the record instead of being guessed at afterwards.
+# Prices are $ per million tokens for the model this pipeline uses;
+# batch work is charged at half, which is the whole point of batching.
+PRICES = {"claude-sonnet-4-6": (3.00, 15.00),
+          "claude-haiku-4-5-20251001": (1.00, 5.00)}
+DEFAULT_PRICE = (3.00, 15.00)     # unknown model: assume the dearer one
+SPEND = {}                        # (model, batch?) -> [in, out, calls]
+
+
+def _meter(usage, model="", batch=False):
+    """Add one reply's token usage to the running total, kept apart by
+    model and by whether it was batch priced."""
+    if not isinstance(usage, dict):
+        return
+    row = SPEND.setdefault((str(model), bool(batch)), [0, 0, 0])
+    try:
+        row[0] += (int(usage.get("input_tokens") or 0)
+                   + int(usage.get("cache_read_input_tokens") or 0)
+                   + int(usage.get("cache_creation_input_tokens") or 0))
+        row[1] += int(usage.get("output_tokens") or 0)
+        row[2] += 1
+    except (TypeError, ValueError):
+        pass
+
+
+def install_spend_meter():
+    """Hook every AI call so nothing can be spent without being counted.
+    Wraps requests.post once: Anthropic replies get metered, everything
+    else (Hansard, Supabase) passes straight through untouched."""
+    original = requests.post
+
+    def counted(*args, **kwargs):
+        r = original(*args, **kwargs)
+        url = args[0] if args else kwargs.get("url", "")
+        try:
+            if "api.anthropic.com" in str(url) and r.status_code == 200:
+                body = r.json()
+                if isinstance(body, dict) and "usage" in body:
+                    _meter(body.get("usage"),
+                           body.get("model")
+                           or (kwargs.get("json") or {}).get("model", ""))
+        except Exception:
+            pass          # metering must never break a working call
+        return r
+
+    requests.post = counted
+
+
+def spend_report():
+    """One honest line per model and price band, and the night's total."""
+    print("--- spend this run ---")
+    total, as_if_live = 0.0, 0.0
+    for (model, batch), (tin, tout, calls) in sorted(SPEND.items()):
+        pin, pout = PRICES.get(model, DEFAULT_PRICE)
+        full = (tin * pin + tout * pout) / 1e6
+        cost = full / 2 if batch else full
+        total += cost
+        as_if_live += full
+        print(f"  {model or 'unknown':28s} "
+              f"{'batch' if batch else 'live ':5s} "
+              f"{calls:4d} replies  {tin:>9,} in / {tout:>8,} out  "
+              f"= ${cost:.2f}")
+    print(f"  TOTAL ${total:.2f}")
+    if as_if_live > total + 0.005:
+        print(f"  (all of it at live prices would have been "
+              f"${as_if_live:.2f})")
+
+
+# ------------------------------------------------------- batch plumbing
+# The Batches API is the same model and the same prompts at half price.
+# The trade is time: work is queued rather than answered on the spot.
+# Most batches land within the hour, so the nightly submits, waits, and
+# uses the results in the same run. If one is slow, the batch id is
+# parked in data/batch_state.json and collected the next night: nothing
+# is lost and nothing is paid for twice.
+BATCH_URL = "https://api.anthropic.com/v1/messages/batches"
+
+
+def _ai_headers(key):
+    return {"x-api-key": key, "anthropic-version": "2023-06-01",
+            "content-type": "application/json"}
+
+
+def batch_submit(key, reqs):
+    """Send a list of {custom_id, params} for queued processing.
+    Returns the batch id, or None if the API would not take it."""
+    try:
+        r = requests.post(BATCH_URL, timeout=180, headers=_ai_headers(key),
+                          json={"requests": reqs})
+    except Exception as e:
+        print(f"Batch: submit failed ({e})")
+        return None
+    if r.status_code != 200:
+        print(f"Batch: submit refused HTTP {r.status_code} — "
+              f"{(r.text or '')[:200]}")
+        return None
+    bid = (r.json() or {}).get("id")
+    print(f"Batch: {len(reqs)} requests queued as {bid}")
+    return bid
+
+
+def batch_poll(key, bid, minutes):
+    """Wait up to `minutes` for a batch to finish. Returns the finished
+    batch object, or None if it is still running when patience runs out
+    (which is not a failure: it gets collected next run)."""
+    deadline = time.time() + minutes * 60
+    while True:
+        try:
+            r = requests.get(f"{BATCH_URL}/{bid}", timeout=60,
+                             headers=_ai_headers(key))
+            if r.status_code == 404:
+                print(f"Batch: {bid} no longer exists — dropping it")
+                return "gone"
+            info = r.json() if r.status_code == 200 else {}
+        except Exception as e:
+            print(f"Batch: status check failed ({e})")
+            info = {}
+        if info.get("processing_status") == "ended":
+            counts = info.get("request_counts") or {}
+            print(f"Batch: {bid} finished — {counts}")
+            return info
+        if time.time() >= deadline:
+            print(f"Batch: {bid} still running after {minutes} min — "
+                  f"parked, will collect next run")
+            return None
+        time.sleep(BATCH_POLL_SEC)
+
+
+def batch_results(key, info):
+    """Read a finished batch's results file. Returns
+    {custom_id: reply text}, metering every reply as batch-priced."""
+    url = (info or {}).get("results_url") or \
+        f"{BATCH_URL}/{(info or {}).get('id')}/results"
+    out, errs = {}, 0
+    try:
+        r = requests.get(url, timeout=600, stream=True,
+                         headers=_ai_headers(key))
+        if r.status_code != 200:
+            print(f"Batch: results HTTP {r.status_code} — "
+                  f"{(r.text or '')[:160]}")
+            return {}
+        for line in r.iter_lines():
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            res = row.get("result") or {}
+            if res.get("type") != "succeeded":
+                errs += 1
+                continue
+            msg = res.get("message") or {}
+            _meter(msg.get("usage"), msg.get("model") or MODEL_READ,
+                   batch=True)
+            out[row.get("custom_id")] = "".join(
+                b.get("text", "") for b in msg.get("content", [])
+                if b.get("type") == "text")
+    except Exception as e:
+        print(f"Batch: could not read results ({e})")
+        return out
+    if errs:
+        print(f"Batch: {errs} request(s) did not succeed — "
+              f"their material stays queued for next run")
+    return out
+
+
 def _parse_verdicts(text):
     """Read the classifier's JSON reply. Tolerates fences, chatter
     before or after the array, and a broken item mid-list: every
@@ -810,7 +998,8 @@ def _parse_verdicts(text):
     return out
 
 
-def ai_classify_debates(pending, mp_q, members, known_issues=None):
+def ai_classify_debates(pending, mp_q, members, known_issues=None,
+                        state=None):
     """Read every new contribution IN FULL, in the context of its whole
     debate, and store a small verdict on the speaking MP: issue, stance,
     tone, a one/two-sentence summary, and a verbatim receipt quote.
@@ -827,6 +1016,7 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
     Unclassified material persists in data/pending_class.json and is
     retried on later nights; anything older than CLASS_PENDING_MAX_DAYS
     degrades to a plain snippet so no contribution is ever lost."""
+    state = {} if state is None else state
     if not pending:
         print("Classify: nothing pending")
         return
@@ -903,10 +1093,8 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
         '{"i": <index>, "issue": "...", "stance": "...", "tone": "...", '
         '"sum": "...", "q": "..."}.\n\n')
 
-    def ask(deb, ctx, s, e):
-        """One classification call for items s..e-1 (with context from
-        ctx). Returns {index: verdict} or None if nothing usable came
-        back. Rescues every well-formed verdict from a messy reply."""
+    def build(deb, ctx, s, e):
+        """The exact prompt for items s..e-1, with context from ctx."""
         its = deb["items"]
         contribs = []
         for j in range(ctx, e):
@@ -917,18 +1105,18 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
                              else its[j]["txt"][:CLASS_CTX_CHARS]})
         payload = {"debate": deb["title"], "date": deb["d"],
                    "contributions": contribs}
+        return rules + json.dumps(payload, ensure_ascii=False)
+
+    def ask_live(deb, ctx, s, e):
+        """Full-price immediate call. Only used if batching is refused."""
         try:
-            r = requests.post(ANTHROPIC_URL, timeout=240, headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }, json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 8000,
-                "messages": [{"role": "user", "content":
-                              rules + json.dumps(payload,
-                                                 ensure_ascii=False)}],
-            })
+            r = requests.post(ANTHROPIC_URL, timeout=240,
+                              headers=_ai_headers(key),
+                              json={"model": MODEL_READ,
+                                    "max_tokens": 8000,
+                                    "messages": [{"role": "user",
+                                                  "content": build(deb, ctx,
+                                                                   s, e)}]})
         except Exception as exc:
             print(f"Classify: call failed ({exc})")
             return None
@@ -947,12 +1135,16 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
         return results
 
     def apply(deb, s, e, results):
+        """Store the verdicts. An item is only ever marked done once,
+        so nothing can be filed or paid for twice."""
         nonlocal classified
         its = deb["items"]
         for j in range(s, e):
+            if j >= len(its):
+                continue
             it = its[j]
             if it.get("done"):
-                continue  # already stored on an earlier run — never twice
+                continue
             g = results.get(j)
             if not g:
                 continue
@@ -974,31 +1166,110 @@ def ai_classify_debates(pending, mp_q, members, known_issues=None):
             it["done"] = True
             classified += 1
 
-    done_ids, classified, rescued = set(), 0, 0
-    for deb, ctx, s, e in chunks:
+    by_ext = {d["ext"]: d for d in pending}
+
+    def deliver(replies, plan):
+        """Match a batch's replies back to the contributions they were
+        written for, using the reference we sent with each request."""
+        got = 0
+        for cid, text in replies.items():
+            job = plan.get(cid)
+            if not job:
+                continue          # reference we no longer recognise
+            deb = by_ext.get(job["ext"])
+            if not deb:
+                continue          # that debate is finished or aged out
+            verdicts = _parse_verdicts(text)
+            if not verdicts:
+                print(f"Classify: unreadable reply for "
+                      f"{deb['title'][:40]} items {job['s']}-{job['e'] - 1}")
+                continue
+            before = classified
+            apply(deb, job["s"], job["e"], verdicts)
+            got += classified - before
+        return got
+
+    classified = 0
+
+    # 1. collect anything parked by an earlier run, before spending again
+    parked = (state or {}).get("classify") or {}
+    if parked.get("id"):
+        print(f"Classify: collecting parked batch {parked['id']}…")
+        info = batch_poll(key, parked["id"], BATCH_COLLECT_MIN)
+        if info == "gone":
+            state.pop("classify", None)
+        elif info:
+            got = deliver(batch_results(key, info), parked.get("plan") or {})
+            print(f"Classify: {got} contributions collected from "
+                  f"the parked batch")
+            state.pop("classify", None)
+        else:
+            print("Classify: parked batch not ready — nothing new submitted "
+                  "tonight, it will be collected next run")
+            _age_out_pending(pending, mp_q)
+            return
+
+    # 2. build tonight's work. A span that has already been tried once
+    #    and come back unusable is re-sent in small pieces, so one
+    #    awkward speech cannot keep sinking two dozen others.
+    chunks = []
+    for deb in sorted(pending, key=lambda d: d.get("d", "")):
         its = deb["items"]
-        if all(its[j].get("done") for j in range(s, e)):
-            continue  # this span was fully marked on an earlier run
-        results = ask(deb, ctx, s, e)
-        if results:
-            apply(deb, s, e, results)
-        # anything still unmarked in a big span: retry once, five at a
-        # time, so one awkward speech can't sink twenty-four others
-        left = [j for j in range(s, e) if not its[j].get("done")]
-        if len(left) > CLASS_SPLIT:
-            for s2 in range(s, e, CLASS_SPLIT):
-                e2 = min(e, s2 + CLASS_SPLIT)
-                if all(its[j].get("done") for j in range(s2, e2)):
-                    continue
-                before = classified
-                res2 = ask(deb, max(0, s2 - 2), s2, e2)
-                if res2:
-                    apply(deb, s2, e2, res2)
-                    rescued += classified - before
-        if all(i.get("done") for i in its):
-            done_ids.add(deb["ext"])
-    if rescued:
-        print(f"Classify: {rescued} contributions rescued by small-batch retry")
+        retry = any(i.get("try") and not i.get("done") for i in its)
+        step = CLASS_SPLIT if retry else CLASS_CHUNK
+        for s in range(0, len(its), step):
+            e = min(len(its), s + step)
+            if all(its[j].get("done") for j in range(s, e)):
+                continue
+            chunks.append((deb, max(0, s - 2), s, e))
+    chunks = chunks[:CLASS_CHUNK_CAP]
+    if not chunks:
+        print("Classify: nothing new to read")
+        _age_out_pending(pending, mp_q)
+        return
+    print(f"Classify: {len(pending)} debates pending, "
+          f"{len(chunks)} chunk(s) to read…")
+
+    reqs, plan = [], {}
+    for n, (deb, ctx, s, e) in enumerate(chunks[:BATCH_MAX_REQ]):
+        cid = f"c{n}_{deb['ext'].replace('-', '')[:24]}_{s}_{e}"[:64]
+        plan[cid] = {"ext": deb["ext"], "s": s, "e": e}
+        reqs.append({"custom_id": cid,
+                     "params": {"model": MODEL_READ,
+                                "max_tokens": 8000,
+                                "messages": [{"role": "user",
+                                              "content": build(deb, ctx,
+                                                               s, e)}]}})
+        for j in range(s, e):
+            deb["items"][j]["try"] = deb["items"][j].get("try", 0) + 1
+
+    bid = batch_submit(key, reqs)
+    if bid:
+        info = batch_poll(key, bid, BATCH_WAIT_MIN)
+        if info and info != "gone":
+            got = deliver(batch_results(key, info), plan)
+            print(f"Classify: {got} contributions read in this batch")
+            state.pop("classify", None)
+        elif info == "gone":
+            state.pop("classify", None)
+        else:
+            # still running: park it. Tomorrow's run collects it first.
+            state["classify"] = {"id": bid, "plan": plan,
+                                 "sent": date.today().isoformat()}
+    else:
+        # batching refused: fall back to full-price live calls so the
+        # site is never left waiting on a queue that will not take work
+        print("Classify: batching unavailable — falling back to live calls")
+        for deb, ctx, s, e in chunks:
+            its = deb["items"]
+            if all(its[j].get("done") for j in range(s, e)):
+                continue
+            res = ask_live(deb, ctx, s, e)
+            if res:
+                apply(deb, s, e, res)
+
+    done_ids = {d["ext"] for d in pending
+                if all(i.get("done") for i in d["items"])}
     # keep only debates with unclassified items; drop finished ones,
     # and inside partially-done debates keep everything (context matters)
     pending[:] = [d for d in pending if d["ext"] not in done_ids]
@@ -1896,7 +2167,7 @@ def summarise_asks(bill_id, shown):
         r = requests.post(ANTHROPIC_URL, timeout=180, headers={
             "x-api-key": key, "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-        }, json={"model": "claude-sonnet-4-6", "max_tokens": 3000,
+        }, json={"model": MODEL_READ, "max_tokens": 3000,
                  "messages": [{"role": "user", "content": prompt}]})
         txt = "".join(b.get("text", "")
                       for b in r.json().get("content", []))
@@ -1958,7 +2229,7 @@ def _ai_bill_verdicts(cards):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }, json={
-            "model": "claude-sonnet-4-6",
+            "model": MODEL_READ,
             "max_tokens": 1400,
             "messages": [{"role": "user", "content": prompt}],
         })
@@ -2520,7 +2791,7 @@ def _ai_verdicts(board):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }, json={
-            "model": "claude-sonnet-4-6",
+            "model": MODEL_READ,
             "max_tokens": 1200,
             "messages": [{"role": "user", "content": prompt}],
         })
@@ -2562,7 +2833,7 @@ def _map_new_issues_to_areas(unmapped):
         r = requests.post(ANTHROPIC_URL, timeout=120, headers={
             "x-api-key": key, "anthropic-version": "2023-06-01",
             "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 2000,
+            json={"model": MODEL_SORT, "max_tokens": 2000,
                   "messages": [{"role": "user", "content": prompt}]})
         txt = "".join(b.get("text", "") for b in r.json().get("content", []))
         txt = txt.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -2868,6 +3139,8 @@ def main():
     q_monthly = load("q_monthly.json", {})
     mp_q = load("mp_q.json", {})
     pending = load("pending_class.json", [])
+    batch_state = load("batch_state.json", {})
+    install_spend_meter()
 
     if mode == "backfill":
         state, votes, q_monthly, mp_q, pending = {}, {}, {}, {}, []
@@ -2899,8 +3172,9 @@ def main():
 
     aliases = fetch_issue_aliases()
     known_issues = fetch_recent_issue_names(aliases)
-    ai_classify_debates(pending, mp_q, members, known_issues)
+    ai_classify_debates(pending, mp_q, members, known_issues, batch_state)
     save("pending_class.json", pending)
+    save("batch_state.json", batch_state)
 
     # sweep out accidental double verdicts (same MP, same day, same
     # verbatim quote = the same speech marked twice). Where a pair
@@ -2978,6 +3252,7 @@ def main():
     save("votes.json", votes)
     save("q_monthly.json", q_monthly)
     save("mp_q.json", mp_q)
+    spend_report()
     print("=== done ===")
 
 
